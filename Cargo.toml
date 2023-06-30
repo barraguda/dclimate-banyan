@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+    "dclimate-banyan",
+    "rust-example",
+]

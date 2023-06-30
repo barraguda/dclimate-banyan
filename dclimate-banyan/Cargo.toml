@@ -1,0 +1,15 @@
+[package]
+name = "dclimate-banyan"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+banyan = { git="https://github.com/Actyx/banyan.git" }
+banyan-utils = { git="https://github.com/Actyx/banyan.git" }
+cbor-data = { version="0.8", features = ["derive"] }
+chrono = "0.4"
+libipld = "0.14"
+thiserror = "1.0"
