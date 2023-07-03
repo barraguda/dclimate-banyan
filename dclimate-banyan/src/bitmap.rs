@@ -1,6 +1,17 @@
-use cbor_data::codec::{ReadCbor, WriteCbor};
+use std::{
+    io::{Read, Seek, Write},
+    ops::BitOrAssign,
+};
 
-#[derive(Debug, PartialEq, ReadCbor, WriteCbor)]
+use cbor_data::codec::{ReadCbor, WriteCbor};
+use libipld::{
+    cbor::DagCborCodec,
+    prelude::{Decode, Encode},
+};
+
+use crate::error::Result;
+
+#[derive(Clone, Copy, Debug, PartialEq, ReadCbor, WriteCbor)]
 pub struct Bitmap(u64);
 
 impl Bitmap {
@@ -21,6 +32,24 @@ impl Bitmap {
     pub(crate) fn get(&self, index: usize) -> bool {
         let mask = 1 << (63 - index);
         self.0 & mask > 0
+    }
+}
+
+impl BitOrAssign for Bitmap {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 = self.0 | rhs.0
+    }
+}
+
+impl Encode<DagCborCodec> for Bitmap {
+    fn encode<W: Write>(&self, c: DagCborCodec, w: &mut W) -> Result<()> {
+        self.0.encode(c, w)
+    }
+}
+
+impl Decode<DagCborCodec> for Bitmap {
+    fn decode<R: Read + Seek>(c: DagCborCodec, r: &mut R) -> Result<Self> {
+        Ok(Self(u64::decode(c, r)?))
     }
 }
 

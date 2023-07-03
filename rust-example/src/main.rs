@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use chrono::NaiveDateTime;
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use dclimate_banyan::{
     memory_store, BanyanStore, ColumnDefinition,
     ColumnType::{Float, Timestamp},
@@ -13,51 +13,51 @@ const SIZE_64_MB: usize = 1 << 26;
 fn usw_data_definition() -> DataDefinition {
     DataDefinition(
         [
-            ("date", Timestamp, true),
-            ("acmh", Float, false),
-            ("acsh", Float, false),
-            ("awnd", Float, false),
-            ("fmtm", Float, false),
-            ("gaht", Float, false),
-            ("pgtm", Float, false),
-            ("prcp", Float, false),
-            ("psun", Float, false),
-            ("snow", Float, false),
-            ("snwd", Float, false),
-            ("tavg", Float, false),
-            ("tmax", Float, false),
-            ("tmin", Float, false),
-            ("tsun", Float, false),
-            ("wdf1", Float, false),
-            ("wdf2", Float, false),
-            ("wdf5", Float, false),
-            ("wdfg", Float, false),
-            ("wesd", Float, false),
-            ("wsf1", Float, false),
-            ("wsf2", Float, false),
-            ("wsf5", Float, false),
-            ("wsfg", Float, false),
-            ("wt01", Float, false),
-            ("wt02", Float, false),
-            ("wt03", Float, false),
-            ("wt04", Float, false),
-            ("wt05", Float, false),
-            ("wt06", Float, false),
-            ("wt07", Float, false),
-            ("wt08", Float, false),
-            ("wt09", Float, false),
-            ("wt10", Float, false),
-            ("wt11", Float, false),
-            ("wt13", Float, false),
-            ("wt14", Float, false),
-            ("wt15", Float, false),
-            ("wt16", Float, false),
-            ("wt17", Float, false),
-            ("wt18", Float, false),
-            ("wt19", Float, false),
-            ("wt21", Float, false),
-            ("wt22", Float, false),
-            ("wv03", Float, false),
+            ("DATE", Timestamp, true),
+            ("ACMH", Float, false),
+            ("ACSH", Float, false),
+            ("AWND", Float, false),
+            ("FMTM", Float, false),
+            ("GAHT", Float, false),
+            ("PGTM", Float, false),
+            ("PRCP", Float, true),
+            ("PSUN", Float, false),
+            ("SNOW", Float, false),
+            ("SNWD", Float, false),
+            ("TAVG", Float, false),
+            ("TMAX", Float, true),
+            ("TMIN", Float, false),
+            ("TSUN", Float, false),
+            ("WDF1", Float, false),
+            ("WDF2", Float, false),
+            ("WDF5", Float, false),
+            ("WDFG", Float, false),
+            ("WESD", Float, false),
+            ("WSF1", Float, false),
+            ("WSF2", Float, false),
+            ("WSF5", Float, false),
+            ("WSFG", Float, false),
+            ("WT01", Float, false),
+            ("WT02", Float, false),
+            ("WT03", Float, false),
+            ("WT04", Float, false),
+            ("WT05", Float, false),
+            ("WT06", Float, false),
+            ("WT07", Float, false),
+            ("WT08", Float, false),
+            ("WT09", Float, false),
+            ("WT10", Float, false),
+            ("WT11", Float, false),
+            ("WT13", Float, false),
+            ("WT14", Float, false),
+            ("WT15", Float, false),
+            ("WT16", Float, false),
+            ("WT17", Float, false),
+            ("WT18", Float, false),
+            ("WT19", Float, false),
+            ("WT21", Float, false),
+            ("WT22", Float, false),
+            ("WV03", Float, false),
         ]
         .into_iter()
         .map(|(name, kind, index)| ColumnDefinition::new(name, kind, index))
@@ -78,7 +78,10 @@ fn record_from_csv<'dd>(
             if *column.name == *name {
                 match column.kind {
                     Timestamp => {
-                        record.insert(name.clone(), Value::from(value.parse::<NaiveDateTime>()?));
+                        let date = value.parse::<NaiveDate>()?;
+                        let dt =
+                            NaiveDateTime::new(date, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
+                        record.insert(name.clone(), Value::from(dt));
                     }
                     Float => {
                         record.insert(name.clone(), Value::from(value.parse::<f64>()?));
@@ -108,7 +111,7 @@ where
 fn read_data<S: BanyanStore>(resolver: &Resolver<S>, dd: &DataDefinition, cid: &Cid) -> Result<()> {
     let datastream = resolver.load_datastream(cid, dd);
     for record in datastream.iter()? {
-        println!("{record:?}");
+        println!("{:?}", *record?);
     }
 
     Ok(())

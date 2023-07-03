@@ -52,26 +52,34 @@ impl DataDefinition {
         }
     }
 
-    pub(crate) fn row_from_record(&self, mut record: Record) -> Result<Row> {
+    pub(crate) fn row_from_record(&self, record: Record) -> Result<Row> {
+        self._row_from_record(record, false)
+    }
+
+    pub(crate) fn key_from_record(&self, record: Record) -> Result<TreeKey> {
+        self._row_from_record(record, true)
+    }
+
+    pub(crate) fn _row_from_record(&self, mut record: Record, indexed: bool) -> Result<Row> {
         let mut columns = Bitmap::new();
         let mut values = Vec::new();
         for (index, column) in self.0.iter().enumerate() {
-            match record.values.remove(column.name.as_str()) {
-                Some(value) => {
-                    columns.set(index, true);
-                    values.push(TreeValue::from_value(&column.kind, value)?);
-                }
-                None => {
-                    columns.set(index, false);
+            if indexed && !column.index {
+                columns.set(index, false);
+            } else {
+                match record.values.remove(column.name.as_str()) {
+                    Some(value) => {
+                        columns.set(index, true);
+                        values.push(TreeValue::from_value(&column.kind, value)?);
+                    }
+                    None => {
+                        columns.set(index, false);
+                    }
                 }
             }
         }
 
         Ok(Row(columns, values))
-    }
-
-    pub(crate) fn key_from_record(&self, _r: &Record) -> TreeKey {
-        ()
     }
 
     pub(crate) fn record_from_row(&self, row: Row) -> Result<Record> {

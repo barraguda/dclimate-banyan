@@ -35,8 +35,10 @@ mod integration_tests {
             ColumnDefinition::new("four", ColumnType::Float, false),
             ColumnDefinition::new("five", ColumnType::String, true),
             ColumnDefinition::new("six", ColumnType::String, false),
-            ColumnDefinition::new("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), true),
-            ColumnDefinition::new("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), true),
+            // ColumnDefinition::new("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), true),
+            // ColumnDefinition::new("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), true),
+            ColumnDefinition::new("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), false),
+            ColumnDefinition::new("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), false),
             ColumnDefinition::new("nine", ColumnType::Timestamp, false),
         ])
     }
@@ -61,12 +63,12 @@ mod integration_tests {
         s
     }
 
-    fn make_records<'ds>(definition: &'ds DataDefinition) -> Vec<Record<'ds>> {
+    fn make_records<'ds>(n: i32, definition: &'ds DataDefinition) -> Vec<Record<'ds>> {
         let seven_values = vec!["foo", "bar", "baz"];
         let eight_values = vec!["boo", "far", "faz"];
 
         let mut records = vec![];
-        for i in 0..1000 {
+        for i in 0..n {
             let mut record = definition.record();
             record.insert(
                 "ts".into(),
@@ -112,11 +114,13 @@ mod integration_tests {
         let resolver = Resolver::new(store);
         let datastream = resolver.new_datastream(&definition);
 
-        let records = make_records(&definition);
+        let n = 100000;
+        let records = make_records(n, &definition);
         let datastream = datastream.extend(records.clone())?;
 
         let datastream = resolver.load_datastream(&datastream.cid.unwrap(), &definition);
         let stored: Vec<Record> = datastream.iter()?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(stored.len(), n as usize);
 
         assert_eq!(records, stored);
 

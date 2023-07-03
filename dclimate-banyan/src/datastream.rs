@@ -57,7 +57,7 @@ impl<'ds, S: BanyanStore> Datastream<'ds, S> {
             .into_iter()
             .map(|r| {
                 Ok((
-                    self.data_definition.key_from_record(&r),
+                    self.data_definition.key_from_record(r.clone())?,
                     self.data_definition.row_from_record(r)?,
                 ))
             })
