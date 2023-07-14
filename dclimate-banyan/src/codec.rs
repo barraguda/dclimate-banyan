@@ -33,7 +33,16 @@ impl TreeTypes for TreeType {
 pub(crate) type TreeKey = Row;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TreeSummary(Bitmap, Vec<SummaryValue>);
+pub struct TreeSummary(pub(crate) Bitmap, pub(crate) Vec<SummaryValue>);
+impl TreeSummary {
+    pub(crate) fn get(&self, position: usize) -> Option<&SummaryValue> {
+        if self.0.get(position) {
+            Some(&self.1[(self.0.rank(position + 1) - 1) as usize])
+        } else {
+            None
+        }
+    }
+}
 
 impl Summarizable<TreeSummary> for VecSeq<TreeSummary> {
     fn summarize(&self) -> TreeSummary {
@@ -85,7 +94,7 @@ impl Decode<DagCborCodec> for TreeSummary {
 
 #[repr(u8)]
 #[derive(Clone, Debug, PartialEq)]
-enum SummaryValue {
+pub(crate) enum SummaryValue {
     Timestamp(SummaryRange<i64>),
     Integer(SummaryRange<i64>),
     Float(SummaryRange<f64>),
@@ -176,12 +185,12 @@ impl Decode<DagCborCodec> for SummaryValue {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct SummaryRange<T>
+pub(crate) struct SummaryRange<T>
 where
     T: PartialOrd + Clone,
 {
-    lhs: T,
-    rhs: T,
+    pub(crate) lhs: T,
+    pub(crate) rhs: T,
 }
 
 impl<T> SummaryRange<T>
@@ -400,6 +409,16 @@ impl TryFrom<TreeValue> for usize {
 
 #[derive(Clone, Debug, PartialEq, ReadCbor, WriteCbor)]
 pub(crate) struct Row(pub Bitmap, pub Vec<TreeValue>);
+
+impl Row {
+    pub(crate) fn get(&self, position: usize) -> Option<&TreeValue> {
+        if self.0.get(position) {
+            Some(&self.1[(self.0.rank(position + 1) - 1) as usize])
+        } else {
+            None
+        }
+    }
+}
 
 impl Summarizable<TreeSummary> for VecSeq<Row> {
     fn summarize(&self) -> TreeSummary {

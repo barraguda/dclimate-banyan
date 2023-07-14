@@ -7,44 +7,28 @@ use crate::{
     bitmap::Bitmap,
     codec::{Row, TreeKey, TreeValue},
     error::Result,
-    Value,
+    query::{Query, EQ, GE, GT, LE, LT},
+    value::Value,
 };
 
 #[derive(PartialEq, Debug)]
-pub struct DataDefinition(pub Vec<ColumnDefinition>);
-
-#[derive(PartialEq, Debug)]
-pub struct ColumnDefinition {
-    pub name: String,
-    pub kind: ColumnType,
-    pub index: bool,
-}
-
-impl ColumnDefinition {
-    pub fn new<S: Into<String>>(name: S, kind: ColumnType, index: bool) -> Self {
-        let name = name.into();
-
-        Self { name, kind, index }
-    }
-}
-
-#[repr(u8)]
-#[derive(Debug, PartialEq)]
-pub enum ColumnType {
-    Timestamp = 0,
-    Integer = 1,
-    Float = 2,
-    String = 3,
-    Enum(Vec<&'static str>) = 4,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Record<'dd> {
-    data_definition: &'dd DataDefinition,
-    values: BTreeMap<String, Value>,
-}
+pub struct DataDefinition(Vec<ColumnDefinition>);
 
 impl DataDefinition {
+    pub fn columns(&self) -> impl Iterator<Item = &ColumnDefinition> {
+        self.0.iter()
+    }
+
+    pub fn get_by_name(&self, name: &str) -> Option<&ColumnDefinition> {
+        for column in &self.0 {
+            if column.name == name {
+                return Some(column);
+            }
+        }
+
+        None
+    }
+
     pub fn record<'dd>(&'dd self) -> Record<'dd> {
         Record {
             data_definition: self,
@@ -101,6 +85,102 @@ impl DataDefinition {
     }
 }
 
+impl<S> FromIterator<(S, ColumnType, bool)> for DataDefinition
+where
+    S: Into<String>,
+{
+    fn from_iter<T: IntoIterator<Item = (S, ColumnType, bool)>>(iter: T) -> Self {
+        let mut dd = Self(Vec::new());
+        let mut position = 0;
+        for (name, kind, index) in iter {
+            let column = ColumnDefinition {
+                position,
+                name: name.into(),
+                kind,
+                index,
+            };
+            dd.0.push(column);
+            position += 1;
+        }
+
+        dd
+    }
+}
+
+impl Deref for DataDefinition {
+    type Target = Vec<ColumnDefinition>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[derive(PartialEq, Debug)]
+pub struct ColumnDefinition {
+    position: usize,
+    pub name: String,
+    pub kind: ColumnType,
+    pub index: bool,
+}
+
+impl ColumnDefinition {
+    pub fn lt(&self, value: Value) -> Result<Query> {
+        Ok(Query::new(
+            self.position,
+            LT,
+            TreeValue::from_value(&self.kind, value)?,
+        ))
+    }
+
+    pub fn le(&self, value: Value) -> Result<Query> {
+        Ok(Query::new(
+            self.position,
+            LE,
+            TreeValue::from_value(&self.kind, value)?,
+        ))
+    }
+
+    pub fn eq(&self, value: Value) -> Result<Query> {
+        Ok(Query::new(
+            self.position,
+            EQ,
+            TreeValue::from_value(&self.kind, value)?,
+        ))
+    }
+
+    pub fn ge(&self, value: Value) -> Result<Query> {
+        Ok(Query::new(
+            self.position,
+            GE,
+            TreeValue::from_value(&self.kind, value)?,
+        ))
+    }
+
+    pub fn gt(&self, value: Value) -> Result<Query> {
+        Ok(Query::new(
+            self.position,
+            GT,
+            TreeValue::from_value(&self.kind, value)?,
+        ))
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, PartialEq)]
+pub enum ColumnType {
+    Timestamp = 0,
+    Integer = 1,
+    Float = 2,
+    String = 3,
+    Enum(Vec<&'static str>) = 4,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Record<'dd> {
+    data_definition: &'dd DataDefinition,
+    values: BTreeMap<String, Value>,
+}
+
 impl<'dd> Deref for Record<'dd> {
     type Target = BTreeMap<String, Value>;
 
@@ -121,21 +201,9 @@ mod tests {
 
     fn make_datastream() -> DataDefinition {
         let mut cols = vec![];
-        cols.push(ColumnDefinition::new("one", ColumnType::Integer, true));
+        cols.push(("one", ColumnType::Integer, true));
 
-        DataDefinition(cols)
-    }
-    #[test]
-    fn new_column_definition() {
-        let coldef = ColumnDefinition::new("strref", ColumnType::Integer, true);
-        assert_eq!(coldef.name, String::from("strref"));
-        assert_eq!(coldef.kind, ColumnType::Integer);
-        assert!(coldef.index);
-
-        let coldef = ColumnDefinition::new(String::from("owned"), ColumnType::Float, false);
-        assert_eq!(coldef.name, String::from("owned"));
-        assert_eq!(coldef.kind, ColumnType::Float);
-        assert!(!coldef.index);
+        DataDefinition::from_iter(cols)
     }
 
     #[test]
@@ -144,5 +212,41 @@ mod tests {
         let record = dd.record();
 
         assert!(record.data_definition as *const _ == &dd as *const _);
+    }
+
+    #[test]
+    fn col_cmp() -> Result<()> {
+        let col = ColumnDefinition {
+            position: 32,
+            name: "test".into(),
+            kind: ColumnType::Integer,
+            index: true,
+        };
+
+        // TODO: Validation. Can't query non-indexed columns, query value must be same type as column
+
+        let value = Value::Integer(42);
+        assert_eq!(
+            col.lt(value.clone())?,
+            Query::new(32, LT, TreeValue::Integer(42))
+        );
+        assert_eq!(
+            col.le(value.clone())?,
+            Query::new(32, LE, TreeValue::Integer(42))
+        );
+        assert_eq!(
+            col.eq(value.clone())?,
+            Query::new(32, EQ, TreeValue::Integer(42))
+        );
+        assert_eq!(
+            col.ge(value.clone())?,
+            Query::new(32, GE, TreeValue::Integer(42))
+        );
+        assert_eq!(
+            col.gt(value.clone())?,
+            Query::new(32, GT, TreeValue::Integer(42))
+        );
+
+        Ok(())
     }
 }

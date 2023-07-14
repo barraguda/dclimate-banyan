@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use dclimate_banyan::{
-    memory_store, BanyanStore, ColumnDefinition,
+    memory_store, BanyanStore,
     ColumnType::{Float, Timestamp},
     DataDefinition, Record, Resolver, Result, Value,
 };
@@ -11,58 +11,53 @@ use libipld::Cid;
 const SIZE_64_MB: usize = 1 << 26;
 
 fn usw_data_definition() -> DataDefinition {
-    DataDefinition(
-        [
-            ("DATE", Timestamp, true),
-            ("ACMH", Float, false),
-            ("ACSH", Float, false),
-            ("AWND", Float, false),
-            ("FMTM", Float, false),
-            ("GAHT", Float, false),
-            ("PGTM", Float, false),
-            ("PRCP", Float, true),
-            ("PSUN", Float, false),
-            ("SNOW", Float, false),
-            ("SNWD", Float, false),
-            ("TAVG", Float, false),
-            ("TMAX", Float, true),
-            ("TMIN", Float, false),
-            ("TSUN", Float, false),
-            ("WDF1", Float, false),
-            ("WDF2", Float, false),
-            ("WDF5", Float, false),
-            ("WDFG", Float, false),
-            ("WESD", Float, false),
-            ("WSF1", Float, false),
-            ("WSF2", Float, false),
-            ("WSF5", Float, false),
-            ("WSFG", Float, false),
-            ("WT01", Float, false),
-            ("WT02", Float, false),
-            ("WT03", Float, false),
-            ("WT04", Float, false),
-            ("WT05", Float, false),
-            ("WT06", Float, false),
-            ("WT07", Float, false),
-            ("WT08", Float, false),
-            ("WT09", Float, false),
-            ("WT10", Float, false),
-            ("WT11", Float, false),
-            ("WT13", Float, false),
-            ("WT14", Float, false),
-            ("WT15", Float, false),
-            ("WT16", Float, false),
-            ("WT17", Float, false),
-            ("WT18", Float, false),
-            ("WT19", Float, false),
-            ("WT21", Float, false),
-            ("WT22", Float, false),
-            ("WV03", Float, false),
-        ]
-        .into_iter()
-        .map(|(name, kind, index)| ColumnDefinition::new(name, kind, index))
-        .collect(),
-    )
+    DataDefinition::from_iter(vec![
+        ("DATE", Timestamp, true),
+        ("ACMH", Float, false),
+        ("ACSH", Float, false),
+        ("AWND", Float, false),
+        ("FMTM", Float, false),
+        ("GAHT", Float, false),
+        ("PGTM", Float, false),
+        ("PRCP", Float, true),
+        ("PSUN", Float, false),
+        ("SNOW", Float, false),
+        ("SNWD", Float, false),
+        ("TAVG", Float, false),
+        ("TMAX", Float, true),
+        ("TMIN", Float, false),
+        ("TSUN", Float, false),
+        ("WDF1", Float, false),
+        ("WDF2", Float, false),
+        ("WDF5", Float, false),
+        ("WDFG", Float, false),
+        ("WESD", Float, false),
+        ("WSF1", Float, false),
+        ("WSF2", Float, false),
+        ("WSF5", Float, false),
+        ("WSFG", Float, false),
+        ("WT01", Float, false),
+        ("WT02", Float, false),
+        ("WT03", Float, false),
+        ("WT04", Float, false),
+        ("WT05", Float, false),
+        ("WT06", Float, false),
+        ("WT07", Float, false),
+        ("WT08", Float, false),
+        ("WT09", Float, false),
+        ("WT10", Float, false),
+        ("WT11", Float, false),
+        ("WT13", Float, false),
+        ("WT14", Float, false),
+        ("WT15", Float, false),
+        ("WT16", Float, false),
+        ("WT17", Float, false),
+        ("WT18", Float, false),
+        ("WT19", Float, false),
+        ("WT21", Float, false),
+        ("WT22", Float, false),
+        ("WV03", Float, false),
+    ])
 }
 
 fn record_from_csv<'dd>(
@@ -74,7 +69,7 @@ fn record_from_csv<'dd>(
         if value.len() == 0 {
             continue;
         }
-        for column in &dd.0 {
+        for column in dd.columns() {
             if *column.name == *name {
                 match column.kind {
                     Timestamp => {
@@ -111,7 +106,7 @@ where
 fn read_data<S: BanyanStore>(resolver: &Resolver<S>, dd: &DataDefinition, cid: &Cid) -> Result<()> {
     let datastream = resolver.load_datastream(cid, dd);
     for record in datastream.iter()? {
-        println!("{:?}", *record?);
+        println!("read: {:?}", *record?);
     }
 
     Ok(())
@@ -135,6 +130,29 @@ fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<()> {
 
     let cid = write_data(resolver, &dd, records)?;
     read_data(resolver, &dd, &cid)?;
+
+    let ts = dd.get_by_name("DATE").unwrap();
+    let start = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(1975, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+    );
+    let end = NaiveDateTime::new(
+        NaiveDate::from_ymd_opt(1976, 1, 1).unwrap(),
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
+    );
+    let ts_query = ts
+        .ge(Value::Timestamp(start))
+        .and(ts.lt(Value::Timestamp(end)))?;
+
+    let prcp = dd.get_by_name("PRCP").unwrap();
+    let prcp_query = prcp.gt(Value::Float(0.0))?;
+    let query = ts_query.and(prcp_query);
+
+    let datastream = resolver.load_datastream(&cid, &dd);
+    let results = datastream.query(&query)?;
+    for record in results {
+        println!("result: {:?}", *record?);
+    }
 
     Ok(())
 }

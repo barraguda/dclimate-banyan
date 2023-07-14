@@ -6,7 +6,7 @@ use crate::{
     data_definition::{DataDefinition, Record},
     error::Result,
     resolver::Resolver,
-    BanyanStore,
+    BanyanStore, Query,
 };
 
 pub struct Datastream<'ds, S: BanyanStore> {
@@ -75,6 +75,19 @@ impl<'ds, S: BanyanStore> Datastream<'ds, S> {
         let txn = Transaction::new(forest, self.resolver.store.clone());
         let tree = txn.load_tree::<Row>(Secrets::default(), self.cid.unwrap().try_into()?)?;
         let records = txn.iter_from(&tree).map(|item| {
+            let (_i, _k, row) = item?;
+            self.data_definition.record_from_row(row)
+        });
+
+        Ok(records)
+    }
+
+    pub fn query(&self, query: &Query) -> Result<impl Iterator<Item = Result<Record>>> {
+        let forest =
+            Forest::<TreeType, _>::new(self.resolver.store.clone(), BranchCache::new(1024));
+        let txn = Transaction::new(forest, self.resolver.store.clone());
+        let tree = txn.load_tree::<Row>(Secrets::default(), self.cid.unwrap().try_into()?)?;
+        let records = txn.iter_filtered(&tree, query.clone()).map(|item| {
             let (_i, _k, row) = item?;
             self.data_definition.record_from_row(row)
         });
