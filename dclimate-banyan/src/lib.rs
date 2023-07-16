@@ -3,6 +3,7 @@ mod codec;
 mod data_definition;
 mod datastream;
 mod error;
+mod query;
 mod resolver;
 mod value;
 
@@ -11,6 +12,7 @@ use banyan_utils::tags::Sha256Digest;
 
 pub use data_definition::{ColumnDefinition, ColumnType, DataDefinition, Record};
 pub use error::{ConversionError, Result};
+pub use query::Query;
 pub use resolver::{memory_store, Resolver};
 pub use value::Value;
 
@@ -27,19 +29,19 @@ mod integration_tests {
     const SIZE_64_MB: usize = 1 << 26;
 
     fn get_data_definition() -> DataDefinition {
-        DataDefinition(vec![
-            ColumnDefinition::new("ts", ColumnType::Timestamp, true),
-            ColumnDefinition::new("one", ColumnType::Integer, true),
-            ColumnDefinition::new("two", ColumnType::Integer, false),
-            ColumnDefinition::new("three", ColumnType::Float, true),
-            ColumnDefinition::new("four", ColumnType::Float, false),
-            ColumnDefinition::new("five", ColumnType::String, true),
-            ColumnDefinition::new("six", ColumnType::String, false),
-            // ColumnDefinition::new("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), true),
-            // ColumnDefinition::new("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), true),
-            ColumnDefinition::new("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), false),
-            ColumnDefinition::new("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), false),
-            ColumnDefinition::new("nine", ColumnType::Timestamp, false),
+        DataDefinition::from_iter(vec![
+            ("ts", ColumnType::Timestamp, true),
+            ("one", ColumnType::Integer, true),
+            ("two", ColumnType::Integer, false),
+            ("three", ColumnType::Float, true),
+            ("four", ColumnType::Float, false),
+            ("five", ColumnType::String, true),
+            ("six", ColumnType::String, false),
+            // ("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), true),
+            // ("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), true),
+            ("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), false),
+            ("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), false),
+            ("nine", ColumnType::Timestamp, false),
         ])
     }
 
@@ -123,6 +125,41 @@ mod integration_tests {
         assert_eq!(stored.len(), n as usize);
 
         assert_eq!(records, stored);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query() -> Result<()> {
+        let definition = get_data_definition();
+        let store = memory_store(SIZE_64_MB);
+        let resolver = Resolver::new(store);
+        let datastream = resolver.new_datastream(&definition);
+
+        let n = 100000;
+        let records = make_records(n, &definition);
+        let datastream = datastream.extend(records.clone())?;
+
+        let datastream = resolver.load_datastream(&datastream.cid.unwrap(), &definition);
+        let ts = NaiveDateTime::from_timestamp_opt(12, 0).unwrap();
+        let ts = Value::Timestamp(ts);
+        let query = definition.get_by_name("ts").unwrap().eq(ts)?;
+        let results: Vec<Record> = datastream.query(&query)?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0], records[12]);
+
+        let query = query.or(definition
+            .get_by_name("one")
+            .unwrap()
+            .le(Value::Integer(112))?);
+        let results: Vec<Record> = datastream.query(&query)?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(results.len(), 6);
+        assert_eq!(results[0], records[0]);
+        assert_eq!(results[1], records[1]);
+        assert_eq!(results[2], records[2]);
+        assert_eq!(results[3], records[3]);
+        assert_eq!(results[4], records[4]);
+        assert_eq!(results[5], records[12]);
 
         Ok(())
     }

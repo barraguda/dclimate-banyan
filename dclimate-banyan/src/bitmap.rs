@@ -29,9 +29,24 @@ impl Bitmap {
         }
     }
 
-    pub(crate) fn get(&self, index: usize) -> bool {
+    pub fn get(&self, index: usize) -> bool {
         let mask = 1 << (63 - index);
         self.0 & mask > 0
+    }
+
+    pub fn rank(&self, index: usize) -> u32 {
+        if index == 0 {
+            return 0;
+        }
+        let shifted = self.0 >> (64 - index);
+
+        shifted.count_ones()
+    }
+}
+
+impl From<u64> for Bitmap {
+    fn from(value: u64) -> Self {
+        Bitmap(value)
     }
 }
 
@@ -112,5 +127,22 @@ mod tests {
         assert!(!bm.get(8));
         assert!(bm.get(9));
         assert!(bm.get(10));
+    }
+
+    #[test]
+    fn rank() {
+        let bm = Bitmap(0b1101101101101101101100000000000000000000000000000000000000000000);
+        assert_eq!(bm.rank(0), 0);
+        assert_eq!(bm.rank(1), 1);
+        assert_eq!(bm.rank(2), 2);
+        assert_eq!(bm.rank(3), 2);
+        assert_eq!(bm.rank(4), 3);
+        assert_eq!(bm.rank(5), 4);
+        assert_eq!(bm.rank(6), 4);
+        assert_eq!(bm.rank(7), 5);
+        assert_eq!(bm.rank(8), 6);
+        assert_eq!(bm.rank(9), 6);
+        assert_eq!(bm.rank(10), 7);
+        assert_eq!(bm.rank(64), 14);
     }
 }
