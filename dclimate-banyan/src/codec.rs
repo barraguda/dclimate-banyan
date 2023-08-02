@@ -307,7 +307,7 @@ impl TreeValue {
                 let error = ConversionError::new(&value, format!("{kind:?}"));
                 let choice: String = value.try_into()?;
                 for (i, option) in choices.iter().enumerate() {
-                    if *option == &choice {
+                    if option == &choice {
                         return Ok(TreeValue::Enum(i as u16));
                     }
                 }
@@ -494,7 +494,7 @@ mod tests {
         let tree_value = TreeValue::from_value(&ColumnType::String, value)?;
         assert_eq!(tree_value, TreeValue::String(String::from("Hi Mom!")));
 
-        let column = ColumnType::Enum(vec!["zero", "one", "two"]);
+        let column = ColumnType::Enum(vec!["zero".into(), "one".into(), "two".into()]);
         let value = Value::String("one".into());
         let tree_value = TreeValue::from_value(&column, value)?;
         assert_eq!(tree_value, TreeValue::Enum(1));

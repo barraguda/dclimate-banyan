@@ -1,0 +1,17 @@
+[package]
+name = "py-dclimate-banyan"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "py_dclimcate_banyan"
+crate-type = ["cdylib"]
+
+[dependencies]
+dclimate-banyan = { path = "../dclimate-banyan" }
+pyo3 = { version = "0.19.0", features = ["anyhow", "chrono"] }
+banyan = { git="https://github.com/Actyx/banyan.git" }
+banyan-utils = { git="https://github.com/Actyx/banyan.git" }
+libipld = "0.14"
+

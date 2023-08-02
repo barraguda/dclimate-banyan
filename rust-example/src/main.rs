@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use dclimate_banyan::{
-    memory_store, BanyanStore,
+    ipfs_available, memory_store, BanyanStore,
     ColumnType::{Float, Timestamp},
-    DataDefinition, Record, Resolver, Result, Value,
+    DataDefinition, IpfsStore, Record, Resolver, Result, Value,
 };
 use libipld::Cid;
 
@@ -112,7 +112,7 @@ fn read_data<S: BanyanStore>(resolver: &Resolver<S>, dd: &DataDefinition, cid: &
     Ok(())
 }
 
-fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<()> {
+fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<Cid> {
     let dd = usw_data_definition();
     let mut reader = csv::Reader::from_path("rust-example/USW00003927.csv")?;
     let headers = reader
@@ -154,13 +154,21 @@ fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<()> {
         println!("result: {:?}", *record?);
     }
 
-    Ok(())
+    Ok(cid)
 }
 
 fn main() -> Result<()> {
-    let store = memory_store(SIZE_64_MB);
-    let resolver = Resolver::new(store);
-    usw_example(&resolver)?;
+    if ipfs_available() {
+        println!("IPFS available");
+        let resolver = Resolver::new(IpfsStore);
+        let cid = usw_example(&resolver)?;
+
+        println!("{cid:?}");
+    } else {
+        println!("IPFS not available, using memory store");
+        let resolver = Resolver::new(memory_store(SIZE_64_MB));
+        usw_example(&resolver)?;
+    };
 
     Ok(())
 }

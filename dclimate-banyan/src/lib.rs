@@ -10,10 +10,13 @@ mod value;
 use banyan::store::{BlockWriter, ReadOnlyStore};
 use banyan_utils::tags::Sha256Digest;
 
+pub use banyan_utils::ipfs::IpfsStore;
+
 pub use data_definition::{ColumnDefinition, ColumnType, DataDefinition, Record};
+pub use datastream::Datastream;
 pub use error::{ConversionError, Result};
 pub use query::Query;
-pub use resolver::{memory_store, Resolver};
+pub use resolver::{ipfs_available, memory_store, Resolver};
 pub use value::Value;
 
 pub trait BanyanStore: ReadOnlyStore<Sha256Digest> + BlockWriter<Sha256Digest> + Sized {}
@@ -39,8 +42,16 @@ mod integration_tests {
             ("six", ColumnType::String, false),
             // ("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), true),
             // ("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), true),
-            ("seven", ColumnType::Enum(vec!["foo", "bar", "baz"]), false),
-            ("eight", ColumnType::Enum(vec!["boo", "far", "faz"]), false),
+            (
+                "seven",
+                ColumnType::Enum(vec!["foo".into(), "bar".into(), "baz".into()]),
+                false,
+            ),
+            (
+                "eight",
+                ColumnType::Enum(vec!["boo".into(), "far".into(), "faz".into()]),
+                false,
+            ),
             ("nine", ColumnType::Timestamp, false),
         ])
     }
@@ -117,14 +128,22 @@ mod integration_tests {
         let datastream = resolver.new_datastream(&definition);
 
         let n = 100000;
-        let records = make_records(n, &definition);
-        let datastream = datastream.extend(records.clone())?;
+        let all_records = make_records(n, &definition);
+        let mut records_iter = all_records.clone().into_iter();
+        let records: Vec<Record> = records_iter.by_ref().take(n as usize / 2).collect();
+        let datastream = datastream.extend(records)?;
 
         let datastream = resolver.load_datastream(&datastream.cid.unwrap(), &definition);
         let stored: Vec<Record> = datastream.iter()?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(stored.len(), n as usize / 2);
+
+        let records: Vec<Record> = records_iter.collect();
+        assert_eq!(records.len(), n as usize / 2);
+        let datastream = datastream.extend(records)?;
+        let stored = datastream.iter()?.collect::<Result<Vec<Record>>>()?;
         assert_eq!(stored.len(), n as usize);
 
-        assert_eq!(records, stored);
+        assert_eq!(all_records, stored);
 
         Ok(())
     }

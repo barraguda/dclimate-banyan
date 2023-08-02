@@ -11,7 +11,7 @@ use crate::{
     value::Value,
 };
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct DataDefinition(Vec<ColumnDefinition>);
 
 impl DataDefinition {
@@ -115,7 +115,7 @@ impl Deref for DataDefinition {
     }
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct ColumnDefinition {
     position: usize,
     pub name: String,
@@ -166,19 +166,28 @@ impl ColumnDefinition {
 }
 
 #[repr(u8)]
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ColumnType {
     Timestamp = 0,
     Integer = 1,
     Float = 2,
     String = 3,
-    Enum(Vec<&'static str>) = 4,
+    Enum(Vec<String>) = 4,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record<'dd> {
-    data_definition: &'dd DataDefinition,
-    values: BTreeMap<String, Value>,
+    pub data_definition: &'dd DataDefinition,
+    pub values: BTreeMap<String, Value>,
+}
+
+impl<'dd> Record<'dd> {
+    pub fn new(data_definition: &'dd DataDefinition, values: BTreeMap<String, Value>) -> Self {
+        Self {
+            data_definition,
+            values,
+        }
+    }
 }
 
 impl<'dd> Deref for Record<'dd> {

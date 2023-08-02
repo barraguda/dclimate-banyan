@@ -29,8 +29,7 @@ impl Value {
                 if index >= choices.len() {
                     Err(error)?
                 } else {
-                    let choice = choices[index];
-                    Ok(Value::String(choice.into()))
+                    Ok(Value::String(choices[index].clone()))
                 }
             }
         }
@@ -209,7 +208,11 @@ mod tests {
 
         let tree_value = TreeValue::Enum(1);
         let value = Value::from_tree_value(
-            &ColumnType::Enum(vec!["Hello World!", "Hi Mom!", "Hello Dad, I'm in jail."]),
+            &ColumnType::Enum(vec![
+                "Hello World!".into(),
+                "Hi Mom!".into(),
+                "Hello Dad, I'm in jail.".into(),
+            ]),
             tree_value,
         )?;
         assert_eq!(value, Value::String("Hi Mom!".into()));

@@ -51,8 +51,13 @@ impl<'ds, S: BanyanStore> Datastream<'ds, S> {
         // call.
         let forest =
             Forest::<TreeType, _>::new(self.resolver.store.clone(), BranchCache::new(1024));
-        let mut builder = StreamBuilder::new(Config::debug_fast(), Secrets::default());
         let mut txn = Transaction::new(forest, self.resolver.store.clone());
+        let mut builder = match self.cid {
+            None => StreamBuilder::new(Config::debug_fast(), Secrets::default()),
+            Some(cid) => {
+                txn.load_stream_builder(Secrets::default(), Config::debug_fast(), cid.try_into()?)?
+            }
+        };
         let rows: Result<Vec<(TreeKey, Row)>> = records
             .into_iter()
             .map(|r| {
