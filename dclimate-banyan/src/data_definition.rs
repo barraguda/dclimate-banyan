@@ -7,7 +7,7 @@ use crate::{
     bitmap::Bitmap,
     codec::{Row, TreeKey, TreeValue},
     error::Result,
-    query::{Query, EQ, GE, GT, LE, LT},
+    query::{Query, EQ, GE, GT, LE, LT, NE},
     value::Value,
 };
 
@@ -148,6 +148,14 @@ impl ColumnDefinition {
         ))
     }
 
+    pub fn ne(&self, value: Value) -> Result<Query> {
+        Ok(Query::new(
+            self.position,
+            NE,
+            TreeValue::from_value(&self.kind, value)?,
+        ))
+    }
+
     pub fn ge(&self, value: Value) -> Result<Query> {
         Ok(Query::new(
             self.position,
@@ -246,6 +254,10 @@ mod tests {
         assert_eq!(
             col.eq(value.clone())?,
             Query::new(32, EQ, TreeValue::Integer(42))
+        );
+        assert_eq!(
+            col.ne(value.clone())?,
+            Query::new(32, NE, TreeValue::Integer(42))
         );
         assert_eq!(
             col.ge(value.clone())?,

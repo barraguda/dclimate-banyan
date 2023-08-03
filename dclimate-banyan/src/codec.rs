@@ -34,6 +34,7 @@ pub(crate) type TreeKey = Row;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TreeSummary(pub(crate) Bitmap, pub(crate) Vec<SummaryValue>);
+
 impl TreeSummary {
     pub(crate) fn get(&self, position: usize) -> Option<&SummaryValue> {
         if self.0.get(position) {

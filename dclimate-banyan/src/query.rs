@@ -7,6 +7,7 @@ pub(crate) enum Comparison {
     LT,
     LE,
     EQ,
+    NE,
     GE,
     GT,
 }
@@ -103,6 +104,7 @@ impl QueryCol {
                 LE => *value <= self.value,
                 LT => *value < self.value,
                 EQ => *value == self.value,
+                NE => *value != self.value,
                 GT => *value > self.value,
                 GE => *value >= self.value,
             },
@@ -116,6 +118,7 @@ impl QueryCol {
                 LE => *summary <= self.value,
                 LT => *summary < self.value,
                 EQ => *summary == self.value,
+                NE => summary.not_contains_only(&self.value),
                 GT => *summary > self.value,
                 GE => *summary >= self.value,
             },
@@ -155,6 +158,29 @@ impl PartialEq<TreeValue> for SummaryValue {
             SummaryValue::String(range) => {
                 let other = String::try_from(other.clone()).unwrap();
                 !(other < range.lhs || other > range.rhs)
+            }
+        }
+    }
+}
+
+impl SummaryValue {
+    fn not_contains_only(&self, other: &TreeValue) -> bool {
+        match self {
+            SummaryValue::Timestamp(range) => {
+                let other = i64::try_from(other.clone()).unwrap();
+                !(other == range.lhs && other == range.rhs)
+            }
+            SummaryValue::Integer(range) => {
+                let other = i64::try_from(other.clone()).unwrap();
+                !(other == range.lhs && other == range.rhs)
+            }
+            SummaryValue::Float(range) => {
+                let other = f64::try_from(other.clone()).unwrap();
+                !(other == range.lhs && other == range.rhs)
+            }
+            SummaryValue::String(range) => {
+                let other = String::try_from(other.clone()).unwrap();
+                !(other == range.lhs && other == range.rhs)
             }
         }
     }
@@ -336,6 +362,10 @@ mod tests {
         assert!(!q(EQ, 0, TreeValue::Integer(10)));
         assert!(q(EQ, 0, TreeValue::Integer(16)));
 
+        assert!(q(NE, 0, TreeValue::Integer(20)));
+        assert!(q(NE, 0, TreeValue::Integer(10)));
+        assert!(!q(NE, 0, TreeValue::Integer(16)));
+
         assert!(!q(GE, 0, TreeValue::Integer(20)));
         assert!(q(GE, 0, TreeValue::Integer(10)));
         assert!(q(GE, 0, TreeValue::Integer(16)));
@@ -423,7 +453,7 @@ mod tests {
                         lhs: "Hi Mom!".into(),
                         rhs: "Salve Madre".into(),
                     }),
-                    SummaryValue::Integer(SummaryRange { lhs: 42, rhs: 52 }),
+                    SummaryValue::Integer(SummaryRange { lhs: 42, rhs: 42 }),
                     SummaryValue::Float(SummaryRange {
                         lhs: 2.71828,
                         rhs: 3.21828,
@@ -484,11 +514,43 @@ mod tests {
             query.eval_summary(summary)
         };
 
+        // 16 .. 26
         assert!(!q(LT, 0, TreeValue::Integer(10)));
         assert!(!q(LT, 0, TreeValue::Integer(16)));
         assert!(q(LT, 0, TreeValue::Integer(20)));
         assert!(q(LT, 0, TreeValue::Integer(26)));
         assert!(q(LT, 0, TreeValue::Integer(30)));
+
+        assert!(!q(LE, 0, TreeValue::Integer(10)));
+        assert!(q(LE, 0, TreeValue::Integer(16)));
+        assert!(q(LE, 0, TreeValue::Integer(20)));
+        assert!(q(LE, 0, TreeValue::Integer(26)));
+        assert!(q(LE, 0, TreeValue::Integer(30)));
+
+        assert!(!q(EQ, 0, TreeValue::Integer(10)));
+        assert!(q(EQ, 0, TreeValue::Integer(16)));
+        assert!(q(EQ, 0, TreeValue::Integer(20)));
+        assert!(q(EQ, 0, TreeValue::Integer(26)));
+        assert!(!q(EQ, 0, TreeValue::Integer(30)));
+
+        assert!(q(NE, 0, TreeValue::Integer(10)));
+        assert!(q(NE, 0, TreeValue::Integer(16)));
+        assert!(q(NE, 0, TreeValue::Integer(20)));
+        assert!(q(NE, 0, TreeValue::Integer(26)));
+        assert!(q(NE, 0, TreeValue::Integer(30)));
+        assert!(!q(NE, 8, TreeValue::Integer(42)));
+
+        assert!(q(GT, 0, TreeValue::Integer(10)));
+        assert!(q(GT, 0, TreeValue::Integer(16)));
+        assert!(q(GT, 0, TreeValue::Integer(20)));
+        assert!(!q(GT, 0, TreeValue::Integer(26)));
+        assert!(!q(GT, 0, TreeValue::Integer(30)));
+
+        assert!(q(GE, 0, TreeValue::Integer(10)));
+        assert!(q(GE, 0, TreeValue::Integer(16)));
+        assert!(q(GE, 0, TreeValue::Integer(20)));
+        assert!(q(GE, 0, TreeValue::Integer(26)));
+        assert!(!q(GE, 0, TreeValue::Integer(30)));
     }
 
     #[test]

@@ -12,6 +12,12 @@ Timestamp = _banyan.Timestamp
 _PRIVATE = object()
 
 
+class _PrivateWrapper:
+    def __init__(self, _private, inner):
+        assert _private is _PRIVATE  # prevent user instantiation
+        self._inner = inner
+
+
 class DataDefinition:
     def __init__(self, columns):
         self._inner = _banyan.PyDataDefinition(columns)
@@ -19,11 +25,10 @@ class DataDefinition:
     def record(self):
         return self._inner.record()
 
+    def get_by_name(self, name):
+        return self._inner.get_by_name(name)
 
-class _PrivateWrapper:
-    def __init__(self, _private, inner):
-        assert _private is _PRIVATE  # prevent user instantiation
-        self._inner = inner
+    __getitem__ = get_by_name
 
 
 class Resolver(_PrivateWrapper):
@@ -49,6 +54,9 @@ class Datastream(_PrivateWrapper):
 
     def __iter__(self):
         return iter(self.collect())
+
+    def query(self, query):
+        return iter(self._inner.query(query))
 
 
 def ipfs_resolver():

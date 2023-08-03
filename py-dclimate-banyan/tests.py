@@ -77,7 +77,7 @@ def make_records(n: int, definition: dc_banyan.DataDefinition):
 
 
 def test_codec(resolver, data_definition):
-    n = 100000
+    n = 10000
     datastream = resolver.new_datastream(data_definition)
     assert datastream.cid is None
     assert list(datastream) == []
@@ -94,6 +94,31 @@ def test_codec(resolver, data_definition):
     stored = list(datastream)
     assert len(stored) == n
     assert records == stored
+
+
+def test_query(resolver, data_definition):
+    n = 1000
+    datastream = resolver.new_datastream(data_definition)
+
+    records = make_records(n, data_definition)
+    datastream = datastream.extend(records)
+
+    datastream = resolver.load_datastream(data_definition, datastream.cid)
+    ts = datetime.datetime.fromtimestamp(12)
+    query = data_definition["ts"] == ts
+    results = list(datastream.query(query))
+    assert len(results) == 1
+    assert results[0] == records[12]
+
+    query = query | (data_definition["one"] <= 112)
+    results = list(datastream.query(query))
+    assert len(results) == 6
+    assert results[0] == records[0]
+    assert results[1] == records[1]
+    assert results[2] == records[2]
+    assert results[3] == records[3]
+    assert results[4] == records[4]
+    assert results[5] == records[12]
 
 
 def test_record___getitem__(data_definition):

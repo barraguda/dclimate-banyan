@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, str::FromStr};
 
 use banyan::store::MemStore;
 use banyan_utils::tags::Sha256Digest;
+use chrono::NaiveDateTime;
 use dclimate_banyan::{DataDefinition, IpfsStore, Record, Value};
 use libipld::{multibase::Base, Cid};
 use pyo3::{
@@ -153,6 +154,32 @@ impl PyDatastream {
             },
         }
     }
+
+    pub fn query(&self, query: &PyQuery) -> PyResult<Vec<PyRecord>> {
+        match self.cid {
+            None => Ok(vec![]),
+            Some(cid) => match &self.resolver {
+                ResolverInner::Ipfs(resolver) => {
+                    let datastream = resolver.load_datastream(&cid, &self.data_definition);
+                    let records = datastream
+                        .query(&query.0)?
+                        .map(|r| r.map(PyRecord::wrap))
+                        .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+
+                    Ok(records)
+                }
+                ResolverInner::Memory(resolver) => {
+                    let datastream = resolver.load_datastream(&cid, &self.data_definition);
+                    let records = datastream
+                        .query(&query.0)?
+                        .map(|r| r.map(PyRecord::wrap))
+                        .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+
+                    Ok(records)
+                }
+            },
+        }
+    }
 }
 
 #[pyclass]
@@ -161,7 +188,7 @@ pub struct PyDataDefinition(dclimate_banyan::DataDefinition);
 #[pymethods]
 impl PyDataDefinition {
     #[new]
-    pub fn new(columns: Vec<PyColumnDefinition>) -> Self {
+    pub fn new(columns: Vec<ColumnSpec>) -> Self {
         let dd = dclimate_banyan::DataDefinition::from_iter(columns.into_iter().map(
             |(name, kind, indexed)| {
                 let kind = match kind {
@@ -185,14 +212,71 @@ impl PyDataDefinition {
     pub fn record(&self) -> PyRecord {
         PyRecord::new(self.0.clone())
     }
+
+    pub fn get_by_name(&self, name: &str) -> PyResult<PyColumnDefinition> {
+        match self.0.get_by_name(name) {
+            Some(column) => Ok(PyColumnDefinition(column.clone())),
+            None => Err(PyKeyError::new_err(String::from(name))),
+        }
+    }
 }
 
-pub type PyColumnDefinition = (String, PyColumnType, bool);
+pub type ColumnSpec = (String, PyColumnType, bool);
 
 #[derive(FromPyObject)]
 pub enum PyColumnType {
     NonEnum(u8),
     Enum(Vec<String>),
+}
+
+#[derive(Clone, FromPyObject)]
+pub enum PyValue {
+    Timestamp(NaiveDateTime),
+    Integer(i64),
+    Float(f64),
+    String(String),
+}
+
+impl From<PyValue> for dclimate_banyan::Value {
+    fn from(value: PyValue) -> Self {
+        match value {
+            PyValue::Timestamp(ts) => Value::Timestamp(ts),
+            PyValue::Integer(n) => Value::Integer(n),
+            PyValue::Float(n) => Value::Float(n),
+            PyValue::String(s) => Value::String(s),
+        }
+    }
+}
+
+#[pyclass]
+pub struct PyColumnDefinition(dclimate_banyan::ColumnDefinition);
+
+#[pymethods]
+impl PyColumnDefinition {
+    fn __richcmp__(&self, other: PyValue, op: CompareOp) -> PyResult<PyQuery> {
+        Ok(match op {
+            CompareOp::Lt => PyQuery(self.0.lt(other.into())?),
+            CompareOp::Le => PyQuery(self.0.le(other.into())?),
+            CompareOp::Eq => PyQuery(self.0.eq(other.into())?),
+            CompareOp::Ne => PyQuery(self.0.ne(other.into())?),
+            CompareOp::Gt => PyQuery(self.0.gt(other.into())?),
+            CompareOp::Ge => PyQuery(self.0.ge(other.into())?),
+        })
+    }
+}
+
+#[pyclass]
+pub struct PyQuery(dclimate_banyan::Query);
+
+#[pymethods]
+impl PyQuery {
+    fn __or__(&self, other: &Self) -> Self {
+        PyQuery(self.0.clone().or(other.0.clone()))
+    }
+
+    fn __and__(&self, other: &Self) -> Self {
+        PyQuery(self.0.clone().and(other.0.clone()))
+    }
 }
 
 #[pyclass(mapping)]
@@ -286,7 +370,6 @@ impl From<libipld::cid::Error> for PyCidError {
     }
 }
 
-/// A Python module implemented in Rust.
 #[pymodule]
 fn _banyan(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ipfs_available, m)?)?;
@@ -303,4 +386,67 @@ fn _banyan(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PyRecord>()?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data_definition() -> dclimate_banyan::DataDefinition {
+        dclimate_banyan::DataDefinition::from_iter(vec![(
+            "one",
+            dclimate_banyan::ColumnType::Integer,
+            false,
+        )])
+    }
+
+    #[test]
+    fn test_column_richcmp() -> PyResult<()> {
+        let dd = data_definition();
+        let col = dd.get_by_name("one").unwrap();
+        let pycol = PyColumnDefinition(col.clone());
+        let val = dclimate_banyan::Value::Integer(42);
+        let pyval = PyValue::Integer(42);
+
+        assert_eq!(
+            pycol.__richcmp__(pyval.clone(), CompareOp::Lt)?.0,
+            col.lt(val.clone())?
+        );
+        assert_eq!(
+            pycol.__richcmp__(pyval.clone(), CompareOp::Le)?.0,
+            col.le(val.clone())?
+        );
+        assert_eq!(
+            pycol.__richcmp__(pyval.clone(), CompareOp::Eq)?.0,
+            col.eq(val.clone())?
+        );
+        assert_eq!(
+            pycol.__richcmp__(pyval.clone(), CompareOp::Ne)?.0,
+            col.ne(val.clone())?
+        );
+        assert_eq!(
+            pycol.__richcmp__(pyval.clone(), CompareOp::Gt)?.0,
+            col.gt(val.clone())?
+        );
+        assert_eq!(pycol.__richcmp__(pyval, CompareOp::Ge)?.0, col.ge(val)?);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_query_conjunctions() -> PyResult<()> {
+        let dd = data_definition();
+        let col = dd.get_by_name("one").unwrap();
+        let pycol = PyColumnDefinition(col.clone());
+        let query1 = pycol.__richcmp__(PyValue::Integer(42), CompareOp::Lt)?;
+        let query2 = pycol.__richcmp__(PyValue::Integer(32), CompareOp::Gt)?;
+
+        assert_eq!(
+            query1.__or__(&query2).0,
+            query1.0.clone().or(query2.0.clone())
+        );
+        assert_eq!(query1.__and__(&query2).0, query1.0.and(query2.0));
+
+        Ok(())
+    }
 }
