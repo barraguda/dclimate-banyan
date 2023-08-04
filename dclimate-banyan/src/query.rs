@@ -1,4 +1,4 @@
-use std::cmp::Ordering;
+use std::cmp::{max, min, Ordering};
 
 use crate::codec::{SummaryValue, TreeKey, TreeSummary, TreeType, TreeValue};
 
@@ -276,26 +276,66 @@ impl PartialOrd<TreeValue> for SummaryValue {
     }
 }
 
-impl banyan::query::Query<TreeType> for Query {
+#[derive(Clone, Debug)]
+pub(crate) struct BanyanQuery {
+    pub query: Option<Query>,
+    pub range_start: Option<u64>,
+    pub range_end: Option<u64>,
+}
+
+impl banyan::query::Query<TreeType> for BanyanQuery {
     fn containing(
         &self,
-        _offset: u64,
+        offset: u64,
         index: &banyan::index::LeafIndex<TreeType>,
         res: &mut [bool],
     ) {
+        let range_start = match self.range_start {
+            Some(range_start) => max(range_start, offset),
+            None => offset,
+        };
+        let range_end = match self.range_end {
+            Some(range_end) => min(range_end, offset + res.len() as u64),
+            None => offset + res.len() as u64,
+        };
+
         for (i, key) in index.keys.as_ref().iter().enumerate() {
-            res[i] = self.eval_scalar(key)
+            let index = offset + i as u64;
+            let in_range = !(index < range_start || index >= range_end);
+            res[i] = in_range
+                && match &self.query {
+                    Some(query) => query.eval_scalar(key),
+                    None => true,
+                };
         }
     }
 
     fn intersecting(
         &self,
-        _offset: u64,
+        offset: u64,
         index: &banyan::index::BranchIndex<TreeType>,
         res: &mut [bool],
     ) {
+        let range_start = match self.range_start {
+            Some(range_start) => max(range_start, offset),
+            None => offset,
+        };
+        let range_end = match self.range_end {
+            Some(range_end) => min(range_end, offset + index.count),
+            None => offset + index.count,
+        };
+
+        let mut start_index = offset;
         for (i, summary) in index.summaries.as_ref().iter().enumerate() {
-            res[i] = self.eval_summary(summary)
+            let end_index = start_index + summary.rows;
+            let in_range = !(end_index <= range_start || start_index >= range_end);
+
+            res[i] = in_range
+                && match &self.query {
+                    Some(query) => query.eval_summary(summary),
+                    None => true,
+                };
+            start_index = end_index;
         }
     }
 }
@@ -437,9 +477,9 @@ mod tests {
 
     fn test_summaries() -> Vec<TreeSummary> {
         vec![
-            TreeSummary(
-                0b1010101010101010_0000000000000000_0000000000000000_0000000000000000.into(),
-                vec![
+            TreeSummary {
+                cols: 0b1010101010101010_0000000000000000_0000000000000000_0000000000000000.into(),
+                values: vec![
                     SummaryValue::Integer(SummaryRange { lhs: 16, rhs: 26 }),
                     SummaryValue::Float(SummaryRange {
                         lhs: 3.141592,
@@ -467,10 +507,11 @@ mod tests {
                         rhs: 6678,
                     }),
                 ],
-            ),
-            TreeSummary(
-                0b0101010101010101_0000000000000000_0000000000000000_0000000000000000.into(),
-                vec![
+                rows: 1,
+            },
+            TreeSummary {
+                cols: 0b0101010101010101_0000000000000000_0000000000000000_0000000000000000.into(),
+                values: vec![
                     SummaryValue::Integer(SummaryRange { lhs: 17, rhs: 27 }),
                     SummaryValue::Float(SummaryRange {
                         lhs: 4.141592,
@@ -498,7 +539,8 @@ mod tests {
                         rhs: 7789,
                     }),
                 ],
-            ),
+                rows: 1,
+            },
         ]
     }
 

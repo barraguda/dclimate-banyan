@@ -4,7 +4,7 @@ use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use dclimate_banyan::{
     ipfs_available, memory_store, BanyanStore,
     ColumnType::{Float, Timestamp},
-    DataDefinition, IpfsStore, Record, Resolver, Result, Value,
+    DataDefinition, Datastream, IpfsStore, Record, Result, Value,
 };
 use libipld::Cid;
 
@@ -89,30 +89,7 @@ fn record_from_csv<'dd>(
     Ok(record)
 }
 
-fn write_data<'dd, I, S: BanyanStore>(
-    resolver: &'dd Resolver<S>,
-    dd: &'dd DataDefinition,
-    records: I,
-) -> Result<Cid>
-where
-    I: IntoIterator<Item = Record<'dd>>,
-{
-    let datastream = resolver.new_datastream(dd);
-    let datastream = datastream.extend(records)?;
-
-    Ok(datastream.cid.unwrap())
-}
-
-fn read_data<S: BanyanStore>(resolver: &Resolver<S>, dd: &DataDefinition, cid: &Cid) -> Result<()> {
-    let datastream = resolver.load_datastream(cid, dd);
-    for record in datastream.iter()? {
-        println!("read: {:?}", *record?);
-    }
-
-    Ok(())
-}
-
-fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<Cid> {
+fn usw_example<S: BanyanStore>(store: &S) -> Result<Cid> {
     let dd = usw_data_definition();
     let mut reader = csv::Reader::from_path("rust-example/USW00003927.csv")?;
     let headers = reader
@@ -128,8 +105,14 @@ fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<Cid> {
         records.push(record_from_csv(&dd, record)?);
     }
 
-    let cid = write_data(resolver, &dd, records)?;
-    read_data(resolver, &dd, &cid)?;
+    let datastream = Datastream::new(store.clone(), dd.clone());
+    let datastream = datastream.extend(records)?;
+    let cid = datastream.cid.unwrap();
+
+    let datastream = Datastream::load(&cid, store.clone(), dd.clone());
+    for record in datastream.iter()? {
+        println!("read: {:?}", *record?);
+    }
 
     let ts = dd.get_by_name("DATE").unwrap();
     let start = NaiveDateTime::new(
@@ -148,7 +131,7 @@ fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<Cid> {
     let prcp_query = prcp.gt(Value::Float(0.0))?;
     let query = ts_query.and(prcp_query);
 
-    let datastream = resolver.load_datastream(&cid, &dd);
+    let datastream = Datastream::load(&cid, store.clone(), dd.clone());
     let results = datastream.query(&query)?;
     for record in results {
         println!("result: {:?}", *record?);
@@ -160,14 +143,12 @@ fn usw_example<S: BanyanStore>(resolver: &Resolver<S>) -> Result<Cid> {
 fn main() -> Result<()> {
     if ipfs_available() {
         println!("IPFS available");
-        let resolver = Resolver::new(IpfsStore);
-        let cid = usw_example(&resolver)?;
+        let cid = usw_example(&IpfsStore)?;
 
         println!("{cid:?}");
     } else {
         println!("IPFS not available, using memory store");
-        let resolver = Resolver::new(memory_store(SIZE_64_MB));
-        usw_example(&resolver)?;
+        usw_example(&memory_store(SIZE_64_MB))?;
     };
 
     Ok(())
