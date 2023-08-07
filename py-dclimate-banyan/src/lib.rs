@@ -1,9 +1,7 @@
 use std::{collections::BTreeMap, str::FromStr};
 
-use banyan::store::MemStore;
-use banyan_utils::tags::Sha256Digest;
 use chrono::NaiveDateTime;
-use dclimate_banyan::{DataDefinition, IpfsStore, Record, Value};
+use dclimate_banyan::{DataDefinition, IpfsStore, MemStore, Record, Value};
 use libipld::{multibase::Base, Cid};
 use pyo3::{
     exceptions::{PyKeyError, PyValueError},
@@ -18,166 +16,151 @@ pub fn ipfs_available() -> bool {
 }
 
 #[pyclass]
-pub struct PyResolver(ResolverInner);
+pub struct PyStore(StoreInner);
 
 #[derive(Clone)]
-enum ResolverInner {
-    Ipfs(dclimate_banyan::Resolver<IpfsStore>),
-    Memory(dclimate_banyan::Resolver<MemStore<Sha256Digest>>),
+enum StoreInner {
+    Ipfs(dclimate_banyan::IpfsStore),
+    Memory(dclimate_banyan::MemStore),
 }
 
 #[pyfunction]
-pub fn ipfs_resolver() -> PyResolver {
-    let resolver = dclimate_banyan::Resolver::new(IpfsStore);
-
-    PyResolver(ResolverInner::Ipfs(resolver))
+pub fn ipfs_store() -> PyStore {
+    PyStore(StoreInner::Ipfs(IpfsStore))
 }
 
 #[pyfunction]
-pub fn memory_resolver(max_size: usize) -> PyResolver {
-    let store = dclimate_banyan::memory_store(max_size);
-    let resolver = dclimate_banyan::Resolver::new(store);
-
-    PyResolver(ResolverInner::Memory(resolver))
+pub fn memory_store(max_size: usize) -> PyStore {
+    PyStore(StoreInner::Memory(dclimate_banyan::memory_store(max_size)))
 }
 
-#[pymethods]
-impl PyResolver {
-    pub fn new_datastream(&self, dd: &PyDataDefinition) -> PyDatastream {
-        let resolver = self.0.clone();
-        let data_definition = dd.0.clone();
-
-        PyDatastream {
-            cid: None,
-            data_definition,
-            resolver,
+#[pyfunction]
+pub fn new_datastream(store: &PyStore, dd: &PyDataDefinition) -> PyDatastream {
+    match &store.0 {
+        StoreInner::Ipfs(store) => {
+            let datastream = dclimate_banyan::Datastream::new(store.clone(), dd.0.clone());
+            PyDatastream(DatastreamInner::Ipfs(datastream))
+        }
+        StoreInner::Memory(store) => {
+            let datastream = dclimate_banyan::Datastream::new(store.clone(), dd.0.clone());
+            PyDatastream(DatastreamInner::Memory(datastream))
         }
     }
+}
 
-    pub fn load_datastream(
-        &self,
-        data_definition: &PyDataDefinition,
-        cid: &str,
-    ) -> Result<PyDatastream, PyCidError> {
-        let cid = Cid::from_str(cid)?;
+#[pyfunction]
+pub fn load_datastream(
+    cid: &str,
+    store: &PyStore,
+    dd: &PyDataDefinition,
+) -> Result<PyDatastream, PyCidError> {
+    let cid = Cid::from_str(cid)?;
 
-        Ok(PyDatastream {
-            cid: Some(cid),
-            data_definition: data_definition.0.clone(),
-            resolver: self.0.clone(),
-        })
+    match &store.0 {
+        StoreInner::Ipfs(store) => {
+            let datastream = dclimate_banyan::Datastream::load(&cid, store.clone(), dd.0.clone());
+            Ok(PyDatastream(DatastreamInner::Ipfs(datastream)))
+        }
+        StoreInner::Memory(store) => {
+            let datastream = dclimate_banyan::Datastream::load(&cid, store.clone(), dd.0.clone());
+            Ok(PyDatastream(DatastreamInner::Memory(datastream)))
+        }
     }
 }
 
 #[pyclass]
-pub struct PyDatastream {
-    cid: Option<Cid>,
-    data_definition: dclimate_banyan::DataDefinition,
-    resolver: ResolverInner,
+pub struct PyDatastream(DatastreamInner);
+
+#[derive(Clone)]
+enum DatastreamInner {
+    Ipfs(dclimate_banyan::Datastream<IpfsStore>),
+    Memory(dclimate_banyan::Datastream<MemStore>),
 }
 
 #[pymethods]
 impl PyDatastream {
     #[getter]
     pub fn cid(&self) -> Option<String> {
-        match &self.cid {
-            Some(cid) => Some(cid.to_string_of_base(Base::Base32Lower).unwrap()),
-            None => None,
-        }
+        let cid = match &self.0 {
+            DatastreamInner::Ipfs(ds) => ds.cid,
+            DatastreamInner::Memory(ds) => ds.cid,
+        };
+
+        cid.map(|cid| cid.to_string_of_base(Base::Base32Lower).unwrap())
     }
 
     pub fn extend(&self, pyrecords: &PySequence) -> PyResult<Self> {
-        let cid = match &self.resolver {
-            ResolverInner::Ipfs(resolver) => {
-                let datastream = match self.cid {
-                    None => resolver.new_datastream(&self.data_definition),
-                    Some(cid) => resolver.load_datastream(&cid, &self.data_definition),
-                };
+        match &self.0 {
+            DatastreamInner::Ipfs(datastream) => {
                 let records = pyrecords
                     .iter()?
                     .map(|o| {
                         let pyrecord: PyRecord = o?.extract()?;
-                        let record = Record::new(&self.data_definition, pyrecord.values);
+                        let record = Record::new(&datastream.data_definition, pyrecord.values);
 
                         Ok(record)
                     })
                     .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
-                datastream.extend(records)?.cid.unwrap()
+
+                let datastream = datastream.clone().extend(records)?;
+                Ok(Self(DatastreamInner::Ipfs(datastream)))
             }
-            ResolverInner::Memory(resolver) => {
-                let datastream = match self.cid {
-                    None => resolver.new_datastream(&self.data_definition),
-                    Some(cid) => resolver.load_datastream(&cid, &self.data_definition),
-                };
+            DatastreamInner::Memory(datastream) => {
                 let records = pyrecords
                     .iter()?
                     .map(|o| {
                         let pyrecord: PyRecord = o?.extract()?;
-                        let record = Record::new(&self.data_definition, pyrecord.values);
+                        let record = Record::new(&datastream.data_definition, pyrecord.values);
 
                         Ok(record)
                     })
                     .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
-                datastream.extend(records)?.cid.unwrap()
-            }
-        };
 
-        Ok(Self {
-            cid: Some(cid),
-            data_definition: self.data_definition.clone(),
-            resolver: self.resolver.clone(),
-        })
+                let datastream = datastream.clone().extend(records)?;
+                Ok(Self(DatastreamInner::Memory(datastream)))
+            }
+        }
     }
 
     pub fn collect(&self) -> PyResult<Vec<PyRecord>> {
-        match self.cid {
-            None => Ok(vec![]),
-            Some(cid) => match &self.resolver {
-                ResolverInner::Ipfs(resolver) => {
-                    let datastream = resolver.load_datastream(&cid, &self.data_definition);
-                    let records = datastream
-                        .iter()?
-                        .map(|r| r.map(PyRecord::wrap))
-                        .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+        match &self.0 {
+            DatastreamInner::Ipfs(datastream) => {
+                let records = datastream
+                    .iter()?
+                    .map(|r| r.map(PyRecord::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
 
-                    Ok(records)
-                }
-                ResolverInner::Memory(resolver) => {
-                    let datastream = resolver.load_datastream(&cid, &self.data_definition);
-                    let records = datastream
-                        .iter()?
-                        .map(|r| r.map(PyRecord::wrap))
-                        .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+                Ok(records)
+            }
+            DatastreamInner::Memory(datastream) => {
+                let records = datastream
+                    .iter()?
+                    .map(|r| r.map(PyRecord::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
 
-                    Ok(records)
-                }
-            },
+                Ok(records)
+            }
         }
     }
 
     pub fn query(&self, query: &PyQuery) -> PyResult<Vec<PyRecord>> {
-        match self.cid {
-            None => Ok(vec![]),
-            Some(cid) => match &self.resolver {
-                ResolverInner::Ipfs(resolver) => {
-                    let datastream = resolver.load_datastream(&cid, &self.data_definition);
-                    let records = datastream
-                        .query(&query.0)?
-                        .map(|r| r.map(PyRecord::wrap))
-                        .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+        match &self.0 {
+            DatastreamInner::Ipfs(datastream) => {
+                let records = datastream
+                    .query(&query.0)?
+                    .map(|r| r.map(PyRecord::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
 
-                    Ok(records)
-                }
-                ResolverInner::Memory(resolver) => {
-                    let datastream = resolver.load_datastream(&cid, &self.data_definition);
-                    let records = datastream
-                        .query(&query.0)?
-                        .map(|r| r.map(PyRecord::wrap))
-                        .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+                Ok(records)
+            }
+            DatastreamInner::Memory(datastream) => {
+                let records = datastream
+                    .query(&query.0)?
+                    .map(|r| r.map(PyRecord::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
 
-                    Ok(records)
-                }
-            },
+                Ok(records)
+            }
         }
     }
 }
@@ -373,8 +356,10 @@ impl From<libipld::cid::Error> for PyCidError {
 #[pymodule]
 fn _banyan(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(ipfs_available, m)?)?;
-    m.add_function(wrap_pyfunction!(ipfs_resolver, m)?)?;
-    m.add_function(wrap_pyfunction!(memory_resolver, m)?)?;
+    m.add_function(wrap_pyfunction!(ipfs_store, m)?)?;
+    m.add_function(wrap_pyfunction!(load_datastream, m)?)?;
+    m.add_function(wrap_pyfunction!(memory_store, m)?)?;
+    m.add_function(wrap_pyfunction!(new_datastream, m)?)?;
 
     // Column types
     m.add("Timestamp", 0_u8)?;

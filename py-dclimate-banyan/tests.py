@@ -27,11 +27,11 @@ def data_definition():
 
 
 @pytest.fixture(scope="session")
-def resolver():
+def store():
     if dc_banyan.ipfs_available():
-        return dc_banyan.ipfs_resolver()
+        return dc_banyan.ipfs_store()
 
-    return dc_banyan.memory_resolver(SIZE_64_MB)
+    return dc_banyan.memory_store(SIZE_64_MB)
 
 
 def some_string(i: int):
@@ -76,9 +76,9 @@ def make_records(n: int, definition: dc_banyan.DataDefinition):
     return records
 
 
-def test_codec(resolver, data_definition):
+def test_codec(store, data_definition):
     n = 10000
-    datastream = resolver.new_datastream(data_definition)
+    datastream = dc_banyan.new_datastream(store, data_definition)
     assert datastream.cid is None
     assert list(datastream) == []
 
@@ -86,7 +86,7 @@ def test_codec(resolver, data_definition):
     datastream = datastream.extend(records[: n // 2])
     assert datastream.cid is not None
 
-    datastream = resolver.load_datastream(data_definition, datastream.cid)
+    datastream = dc_banyan.load_datastream(datastream.cid, store, data_definition)
     stored = list(datastream)
     assert len(stored) == n // 2
 
@@ -96,14 +96,14 @@ def test_codec(resolver, data_definition):
     assert records == stored
 
 
-def test_query(resolver, data_definition):
+def test_query(store, data_definition):
     n = 1000
-    datastream = resolver.new_datastream(data_definition)
+    datastream = dc_banyan.new_datastream(store, data_definition)
 
     records = make_records(n, data_definition)
     datastream = datastream.extend(records)
 
-    datastream = resolver.load_datastream(data_definition, datastream.cid)
+    datastream = dc_banyan.load_datastream(datastream.cid, store, data_definition)
     ts = datetime.datetime.fromtimestamp(12)
     query = data_definition["ts"] == ts
     results = list(datastream.query(query))

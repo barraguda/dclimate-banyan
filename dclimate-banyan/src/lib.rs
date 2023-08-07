@@ -4,10 +4,9 @@ mod data_definition;
 mod datastream;
 mod error;
 mod query;
-mod resolver;
 mod value;
 
-use banyan::store::{BlockWriter, ReadOnlyStore};
+use banyan::store::{BlockWriter, MemStore as BanyanMemStore, ReadOnlyStore};
 use banyan_utils::tags::Sha256Digest;
 
 pub use banyan_utils::ipfs::IpfsStore;
@@ -16,12 +15,21 @@ pub use data_definition::{ColumnDefinition, ColumnType, DataDefinition, Record};
 pub use datastream::Datastream;
 pub use error::{ConversionError, Result};
 pub use query::Query;
-pub use resolver::{ipfs_available, memory_store, Resolver};
 pub use value::Value;
 
 pub trait BanyanStore: ReadOnlyStore<Sha256Digest> + BlockWriter<Sha256Digest> + Sized {}
 
 impl<S> BanyanStore for S where S: ReadOnlyStore<Sha256Digest> + BlockWriter<Sha256Digest> {}
+
+pub type MemStore = BanyanMemStore<Sha256Digest>;
+
+pub fn memory_store(max_size: usize) -> MemStore {
+    MemStore::new(max_size, Sha256Digest::digest)
+}
+
+pub fn ipfs_available() -> bool {
+    IpfsStore.put(vec![]).is_ok()
+}
 
 #[cfg(test)]
 mod integration_tests {
@@ -121,51 +129,62 @@ mod integration_tests {
     }
 
     #[test]
-    fn test_codec() -> Result<()> {
+    fn test_integration() -> Result<()> {
         let definition = get_data_definition();
         let store = memory_store(SIZE_64_MB);
-        let resolver = Resolver::new(store);
-        let datastream = resolver.new_datastream(&definition);
+        let datastream = Datastream::new(store.clone(), definition.clone());
 
-        let n = 100000;
+        // We want a high level of N to force Banyan to use a second layer in the tree structure, so
+        // we can test summaries.
+        let n = 100_000;
+
+        // Write a bunch of records into the store
         let all_records = make_records(n, &definition);
         let mut records_iter = all_records.clone().into_iter();
         let records: Vec<Record> = records_iter.by_ref().take(n as usize / 2).collect();
         let datastream = datastream.extend(records)?;
 
-        let datastream = resolver.load_datastream(&datastream.cid.unwrap(), &definition);
+        // Verify just the number of records matches
+        let datastream = Datastream::load(&datastream.cid.unwrap(), store, definition.clone());
         let stored: Vec<Record> = datastream.iter()?.collect::<Result<Vec<Record>>>()?;
         assert_eq!(stored.len(), n as usize / 2);
 
+        // Write a bunch more records into the store. Writing in two batches tests that we can
+        // extend an existing datastream.
         let records: Vec<Record> = records_iter.collect();
         assert_eq!(records.len(), n as usize / 2);
         let datastream = datastream.extend(records)?;
+
+        // Read records back out, verifying all records match
         let stored = datastream.iter()?.collect::<Result<Vec<Record>>>()?;
         assert_eq!(stored.len(), n as usize);
-
         assert_eq!(all_records, stored);
 
-        Ok(())
-    }
+        // Read out a subset of all records by slicing the datastream
+        let view = datastream.slice(100, 200);
+        let sliced = view.iter()?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(sliced.len(), 100);
+        assert_eq!(sliced, all_records[100..200]);
 
-    #[test]
-    fn test_query() -> Result<()> {
-        let definition = get_data_definition();
-        let store = memory_store(SIZE_64_MB);
-        let resolver = Resolver::new(store);
-        let datastream = resolver.new_datastream(&definition);
+        // Read out a subset of all records from a higher range
+        let view = datastream.slice(99100, 99200);
+        let sliced = view.iter()?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(sliced.len(), 100);
+        assert_eq!(sliced, all_records[99100..99200]);
 
-        let n = 100000;
-        let records = make_records(n, &definition);
-        let datastream = datastream.extend(records.clone())?;
+        // Slice a slice
+        let view = view.slice_to(20);
+        let sliced = view.iter()?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(sliced.len(), 20);
+        assert_eq!(sliced, all_records[99100..99120]);
 
-        let datastream = resolver.load_datastream(&datastream.cid.unwrap(), &definition);
+        // Try querying some records
         let ts = NaiveDateTime::from_timestamp_opt(12, 0).unwrap();
         let ts = Value::Timestamp(ts);
         let query = definition.get_by_name("ts").unwrap().eq(ts)?;
         let results: Vec<Record> = datastream.query(&query)?.collect::<Result<Vec<Record>>>()?;
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0], records[12]);
+        assert_eq!(results[0], all_records[12]);
 
         let query = query.or(definition
             .get_by_name("one")
@@ -173,12 +192,19 @@ mod integration_tests {
             .le(Value::Integer(112))?);
         let results: Vec<Record> = datastream.query(&query)?.collect::<Result<Vec<Record>>>()?;
         assert_eq!(results.len(), 6);
-        assert_eq!(results[0], records[0]);
-        assert_eq!(results[1], records[1]);
-        assert_eq!(results[2], records[2]);
-        assert_eq!(results[3], records[3]);
-        assert_eq!(results[4], records[4]);
-        assert_eq!(results[5], records[12]);
+        assert_eq!(results[0], all_records[0]);
+        assert_eq!(results[1], all_records[1]);
+        assert_eq!(results[2], all_records[2]);
+        assert_eq!(results[3], all_records[3]);
+        assert_eq!(results[4], all_records[4]);
+        assert_eq!(results[5], all_records[12]);
+
+        // Try querying a slice
+        let view = datastream.slice_from(4);
+        let results: Vec<Record> = view.query(&query)?.collect::<Result<Vec<Record>>>()?;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0], all_records[4]);
+        assert_eq!(results[1], all_records[12]);
 
         Ok(())
     }

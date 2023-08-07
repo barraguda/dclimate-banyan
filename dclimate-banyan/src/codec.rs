@@ -1,7 +1,7 @@
 use std::io::{Read, Seek, Write};
 
 use banyan::{
-    index::{Summarizable, VecSeq},
+    index::{CompactSeq, Summarizable, VecSeq},
     TreeTypes,
 };
 use banyan_utils::tags::Sha256Digest;
@@ -33,12 +33,16 @@ impl TreeTypes for TreeType {
 pub(crate) type TreeKey = Row;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TreeSummary(pub(crate) Bitmap, pub(crate) Vec<SummaryValue>);
+pub struct TreeSummary {
+    pub(crate) cols: Bitmap,
+    pub(crate) values: Vec<SummaryValue>,
+    pub(crate) rows: u64,
+}
 
 impl TreeSummary {
     pub(crate) fn get(&self, position: usize) -> Option<&SummaryValue> {
-        if self.0.get(position) {
-            Some(&self.1[(self.0.rank(position + 1) - 1) as usize])
+        if self.cols.get(position) {
+            Some(&self.values[(self.cols.rank(position + 1) - 1) as usize])
         } else {
             None
         }
@@ -49,12 +53,14 @@ impl Summarizable<TreeSummary> for VecSeq<TreeSummary> {
     fn summarize(&self) -> TreeSummary {
         let mut columns = Bitmap::new();
         let mut summaries: Vec<Option<SummaryValue>> = vec![None; 64];
+        let mut rows = 0;
         for child in self.as_ref().iter().cloned() {
-            columns |= child.0;
-            let mut values = child.1;
+            rows += child.rows;
+            columns |= child.cols;
+            let mut values = child.values;
             let mut index = 0;
             while values.len() > 0 {
-                if child.0.get(index) {
+                if child.cols.get(index) {
                     let value = values.remove(0);
                     summaries[index] = Some(match &summaries[index] {
                         None => value,
@@ -71,14 +77,19 @@ impl Summarizable<TreeSummary> for VecSeq<TreeSummary> {
             .map(|v| v.unwrap())
             .collect();
 
-        TreeSummary(columns, summaries)
+        TreeSummary {
+            cols: columns,
+            values: summaries,
+            rows,
+        }
     }
 }
 
 impl Encode<DagCborCodec> for TreeSummary {
     fn encode<W: Write>(&self, c: DagCborCodec, w: &mut W) -> Result<()> {
-        self.0.encode(c, w)?;
-        self.1.encode(c, w)?;
+        self.cols.encode(c, w)?;
+        self.values.encode(c, w)?;
+        self.rows.encode(c, w)?;
 
         Ok(())
     }
@@ -88,8 +99,13 @@ impl Decode<DagCborCodec> for TreeSummary {
     fn decode<R: Read + Seek>(c: DagCborCodec, r: &mut R) -> Result<Self> {
         let columns = Bitmap::decode(c, r)?;
         let summaries = Vec::decode(c, r)?;
+        let rows = u64::decode(c, r)?;
 
-        Ok(Self(columns, summaries))
+        Ok(Self {
+            cols: columns,
+            values: summaries,
+            rows: rows,
+        })
     }
 }
 
@@ -447,7 +463,11 @@ impl Summarizable<TreeSummary> for VecSeq<Row> {
             .map(|v| v.unwrap())
             .collect();
 
-        TreeSummary(columns, summaries)
+        TreeSummary {
+            cols: columns,
+            values: summaries,
+            rows: self.len() as u64,
+        }
     }
 }
 

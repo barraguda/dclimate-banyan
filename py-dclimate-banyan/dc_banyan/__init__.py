@@ -3,6 +3,8 @@ import dc_banyan._banyan as _banyan
 
 # Re-exports
 ipfs_available = _banyan.ipfs_available
+ipfs_store = _banyan.ipfs_store
+memory_store = _banyan.memory_store
 Float = _banyan.Float
 Integer = _banyan.Integer
 Record = _banyan.PyRecord
@@ -10,6 +12,16 @@ String = _banyan.String
 Timestamp = _banyan.Timestamp
 
 _PRIVATE = object()
+
+
+def new_datastream(store, data_definition):
+    return Datastream(_PRIVATE, _banyan.new_datastream(store, data_definition._inner))
+
+
+def load_datastream(cid, store, data_definition):
+    return Datastream(
+        _PRIVATE, _banyan.load_datastream(cid, store, data_definition._inner)
+    )
 
 
 class _PrivateWrapper:
@@ -31,16 +43,6 @@ class DataDefinition:
     __getitem__ = get_by_name
 
 
-class Resolver(_PrivateWrapper):
-    def new_datastream(self, data_definition):
-        return Datastream(_PRIVATE, self._inner.new_datastream(data_definition._inner))
-
-    def load_datastream(self, data_definition, cid):
-        return Datastream(
-            _PRIVATE, self._inner.load_datastream(data_definition._inner, cid)
-        )
-
-
 class Datastream(_PrivateWrapper):
     @property
     def cid(self):
@@ -50,6 +52,9 @@ class Datastream(_PrivateWrapper):
         return Datastream(_PRIVATE, self._inner.extend(records))
 
     def collect(self):
+        if self.cid is None:
+            return ()
+
         return self._inner.collect()
 
     def __iter__(self):
@@ -57,14 +62,6 @@ class Datastream(_PrivateWrapper):
 
     def query(self, query):
         return iter(self._inner.query(query))
-
-
-def ipfs_resolver():
-    return Resolver(_PRIVATE, _banyan.ipfs_resolver())
-
-
-def memory_resolver(max_size: int):
-    return Resolver(_PRIVATE, _banyan.memory_resolver(max_size))
 
 
 def Enum(options: typing.Sequence[str]):

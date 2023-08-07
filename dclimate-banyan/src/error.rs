@@ -31,3 +31,7 @@ impl DecodeError {
         DecodeError { src, dst }
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("Operation invalid for uninitialized datastreams")]
+pub struct UninitializedDatastreamError;
