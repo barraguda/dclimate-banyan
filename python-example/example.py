@@ -16,7 +16,8 @@ def main():
     """
     First we need to define the data we're going to be storing. This cannot change once
     you've started writing data for a datastream. A new data definition requires a new
-    stream. This includes any columns declared as indexes.
+    stream. This includes any columns declared as indexes. Indexes cannot be generated
+    post facto.
 
     The definition itself is somewhat verbose so we just call a function here. See the
     function below for the full data definition.
