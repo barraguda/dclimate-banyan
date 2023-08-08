@@ -1,8 +1,104 @@
+"""
+Example of using `dc_banyan` to store station data.
+"""
 import csv
+import datetime
+import os
+import pprint
+
 import dc_banyan
 
 
 SIZE_64_MB = 1 << 26
+
+
+def main():
+    """
+    First we need to define the data we're going to be storing. This cannot change once
+    you've started writing data for a datastream. A new data definition requires a new
+    stream. This includes any columns declared as indexes.
+
+    The definition itself is somewhat verbose so we just call a function here. See the
+    function below for the full data definition.
+    """
+    data_definition = usw_data_definition()
+
+    """
+    For this example, we read in some records from a CSV file. This part doesn't have
+    anything to with dc_banyan, so it's encapsulated in a function below. This function
+    returns a generator that yields dictionaries containing data corresponding to the
+    data definition.
+    """
+    records = read_usw_data(data_definition)
+
+    """
+    We have to use the Banyan data definition to create a record that can be stored in
+    Banyan. (I will refactor to get rid of this step, soon, as this really should be
+    unnecessary.)
+    """
+    records = [data_definition.record(record) for record in records]
+
+    """
+    Next we need a store. There are only two choices here. There is a memory based store
+    that is useful for testing, and an IPFS store that talks to a locally running IPFS
+    daemon via the HTTP API.
+    """
+    store = (
+        dc_banyan.ipfs_store()
+        if dc_banyan.ipfs_available()
+        else dc_banyan.memory_store(SIZE_64_MB)
+    )
+
+    """
+    We're starting a new datastream, so we'll create one that uses our data dictionary.
+    """
+    datastream = dc_banyan.new_datastream(store, data_definition)
+
+    """
+    Now we just need to add our records to the datastream. Since Banyan makes use of
+    immutable data structures, this yields a new datastream with the new data added to
+    it.
+    """
+    datastream = datastream.extend(records)
+
+    """
+    Our data is written and we now have a CID we can use to get back to it.
+    """
+    cid = datastream.cid
+    print(f"CID: {cid}")
+
+    """
+    That's it really. Data can only be appended. The data dictionary can never change.
+    Using the CID, we can load the data_definition and get data back out of it.
+    """
+    datastream = dc_banyan.load_datastream(cid, store, data_definition)
+
+    """
+    Use slices to retrieve data by index from the stream. Let's look at rows 10-19.
+    """
+    rows = [row.as_dict() for row in datastream[10:20]]
+    pprint.pprint(rows)
+
+    """
+    Use indexing to retrieve records using any of the indexed columns. We can use the
+    DATE column to get records from the first week of July 1975.
+    """
+    july1 = datetime.datetime(1975, 7, 1, 0, 0, 0)
+    july8 = july1 + datetime.timedelta(days=7)
+    datecol = data_definition["DATE"]
+    query = (datecol >= july1) & (datecol < july8)
+    rows = [row.as_dict() for row in datastream.query(query)]
+    pprint.pprint(rows)
+
+    """
+    Or, let's find out how many days with precipitation there were in 1984.
+    """
+    precip = data_definition["PRCP"]
+    start = datetime.datetime(1984, 1, 1, 0, 0, 0)
+    end = datetime.datetime(1985, 1, 1, 0, 0, 0)
+    query = (datecol >= start) & (datecol < end) & (precip > 0.0)
+    rows = list(datastream.query(query))
+    print(f"In 1984 there were {len(rows)} days with precipitation.")
 
 
 def usw_data_definition():
@@ -58,52 +154,30 @@ def usw_data_definition():
 
 
 def parse(column, value):
-    if column.kind == dc_banyan.Timestamp:
-        raise NotImplementedError
+    if column.type == dc_banyan.Timestamp:
+        year, month, day = map(int, value.split("-"))
+        return datetime.datetime(year, month, day, 0, 0, 0)
 
-    elif column.kind == dc_banyan.Float:
+    elif column.type == dc_banyan.Float:
         return float(value)
 
     else:
-        raise NotImplementedError(str(column.kind))
+        raise NotImplementedError(str(column.type))
 
 
-def read_csv(data_definition, stream):
-    reader = csv.DictReader(stream)
+def read_usw_data(data_definition):
+    exclude_keys = {"STATION", "LATITUDE", "LONGITUDE", "ELEVATION", "NAME"}
+    here = os.path.dirname(os.path.abspath(__file__))
+    csv_path = os.path.abspath(
+        os.path.join(here, "..", "rust-example", "USW00003927.csv")
+    )
+    reader = csv.DictReader(open(csv_path))
     for row in reader:
-        yield {key: parse(data_definition[key], value) for key, value in row}
-
-
-def write_data(resolver, data_definition, records):
-    datastream = resolver.new_datastream(data_definition)
-    datastream = datastream.extend(records)
-
-    return datastream.cid
-
-
-def read_data(resolver, data_defintion, cid):
-    datastream = resolver.load_datastream(cid, data_defintion)
-    for record in datastream:
-        print(f"read: {record}")
-
-
-def usw_example(resolver):
-    dd = usw_data_definition()
-    records = read_csv(dd, open("../rust-example/USW00003927.csv"))
-    cid = write_data(resolver, dd, records)
-    read_data(resolver, dd, cid)
-
-    return cid
-
-
-def main():
-    if dc_banyan.ipfs_available():
-        resolver = dc_banyan.memory_resolver()
-    else:
-        resolver = dc_banyan.ipfs_resolver()
-
-    cid = usw_example(resolver)
-    print(f"cid: {cid}")
+        yield {
+            key: parse(data_definition[key], value)
+            for key, value in row.items()
+            if key not in exclude_keys and value != ""
+        }
 
 
 if __name__ == "__main__":

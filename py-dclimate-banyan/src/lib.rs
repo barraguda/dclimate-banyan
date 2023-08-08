@@ -10,6 +10,12 @@ use pyo3::{
     types::{IntoPyDict, PyDict, PySequence},
 };
 
+const TIMESTAMP: u8 = 0;
+const INTEGER: u8 = 1;
+const FLOAT: u8 = 2;
+const STRING: u8 = 3;
+const ENUM_COL: u8 = 4;
+
 #[pyfunction]
 pub fn ipfs_available() -> bool {
     dclimate_banyan::ipfs_available()
@@ -306,6 +312,17 @@ impl PyColumnDefinition {
             CompareOp::Ge => PyQuery(self.0.ge(other.into())?),
         })
     }
+
+    #[getter(type)]
+    fn kind(&self) -> u8 {
+        match self.0.kind {
+            dclimate_banyan::ColumnType::Timestamp => TIMESTAMP,
+            dclimate_banyan::ColumnType::Integer => INTEGER,
+            dclimate_banyan::ColumnType::Float => FLOAT,
+            dclimate_banyan::ColumnType::String => STRING,
+            dclimate_banyan::ColumnType::Enum(_) => ENUM_COL,
+        }
+    }
 }
 
 #[pyclass]
@@ -442,10 +459,10 @@ fn _banyan(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(new_datastream, m)?)?;
 
     // Column types
-    m.add("Timestamp", 0_u8)?;
-    m.add("Integer", 1_u8)?;
-    m.add("Float", 2_u8)?;
-    m.add("String", 3_u8)?;
+    m.add("Timestamp", TIMESTAMP)?;
+    m.add("Integer", INTEGER)?;
+    m.add("Float", FLOAT)?;
+    m.add("String", STRING)?;
 
     m.add_class::<PyDataDefinition>()?;
     m.add_class::<PyRecord>()?;

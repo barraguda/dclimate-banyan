@@ -34,8 +34,16 @@ class DataDefinition:
     def __init__(self, columns):
         self._inner = _banyan.PyDataDefinition(columns)
 
-    def record(self):
-        return self._inner.record()
+    def record(self, raw=None):
+        if isinstance(raw, _banyan.PyRecord):
+            return raw
+
+        record = self._inner.record()
+        if raw is not None:
+            for k, v in raw.items():
+                record[k] = v
+
+        return record
 
     def get_by_name(self, name):
         return self._inner.get_by_name(name)
