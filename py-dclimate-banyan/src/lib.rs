@@ -7,7 +7,7 @@ use pyo3::{
     exceptions::{PyKeyError, PyNotImplementedError, PyValueError},
     prelude::*,
     pyclass::CompareOp,
-    types::PySequence,
+    types::{IntoPyDict, PyDict, PySequence},
 };
 
 #[pyfunction]
@@ -22,6 +22,16 @@ pub struct PyStore(StoreInner);
 enum StoreInner {
     Ipfs(dclimate_banyan::IpfsStore),
     Memory(dclimate_banyan::MemStore),
+}
+
+#[pymethods]
+impl PyStore {
+    pub fn __repr__(&self) -> &str {
+        match &self.0 {
+            StoreInner::Ipfs(_) => "IpfsStore",
+            StoreInner::Memory(_) => "MemStore",
+        }
+    }
 }
 
 #[pyfunction]
@@ -248,6 +258,10 @@ impl PyDataDefinition {
             None => Err(PyKeyError::new_err(String::from(name))),
         }
     }
+
+    pub fn __repr__(&self) -> String {
+        format!("{:?}", self.0)
+    }
 }
 
 pub type ColumnSpec = (String, PyColumnType, bool);
@@ -309,7 +323,7 @@ impl PyQuery {
 }
 
 #[pyclass(mapping)]
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PyRecord {
     data_definition: dclimate_banyan::DataDefinition,
     values: BTreeMap<String, dclimate_banyan::Value>,
@@ -330,6 +344,15 @@ impl PyRecord {
             data_definition: record.data_definition.clone(),
             values: record.values,
         }
+    }
+}
+
+fn value_to_py(value: &Value, py: Python) -> PyObject {
+    match value {
+        Value::Timestamp(value) => value.into_py(py),
+        Value::Integer(value) => value.into_py(py),
+        Value::Float(value) => value.into_py(py),
+        Value::String(value) => value.into_py(py),
     }
 }
 
@@ -366,6 +389,17 @@ impl PyRecord {
             CompareOp::Ne => (*self != *other).into_py(py),
             _ => py.NotImplemented(),
         }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("{:?}", self)
+    }
+
+    fn as_dict<'py>(&self, py: Python<'py>) -> &'py PyDict {
+        self.values
+            .iter()
+            .map(|(key, value)| (key.into_py(py), value_to_py(value, py)))
+            .into_py_dict(py)
     }
 }
 

@@ -149,3 +149,28 @@ def test_record___delitem__(data_definition):
     del record["one"]
     with pytest.raises(KeyError):
         record["one"]
+
+
+def test__repr__(store, data_definition):
+    assert repr(store) in ("MemStore", "IpfsStore")
+    assert '{ position: 0, name: "ts", kind: Timestamp, index: true }' in repr(
+        data_definition
+    )
+    record = make_records(1, data_definition)[0]
+    assert '"one": Integer(100)' in repr(record)
+
+
+def test_as_dict(data_definition):
+    record = make_records(1, data_definition)[0]
+    assert record.as_dict() == {
+        "eight": "boo",
+        "five": "",
+        "four": 0.0,
+        "nine": datetime.datetime(1969, 12, 31, 18, 59, 54),
+        "one": 100,
+        "seven": "foo",
+        "six": "",
+        "three": 0.0,
+        "ts": datetime.datetime(1969, 12, 31, 19, 0),
+        "two": 0,
+    }
