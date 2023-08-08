@@ -95,6 +95,13 @@ def test_codec(store, data_definition):
     assert len(stored) == n
     assert records == stored
 
+    assert list(datastream[100:200]) == records[100:200]
+    assert list(datastream[100:200][:10]) == records[100:110]
+    assert list(datastream[100:200][10:]) == records[110:200]
+    assert datastream[100] == records[100]
+    with pytest.raises(NotImplementedError):
+        datastream[100:200].extend(records)
+
 
 def test_query(store, data_definition):
     n = 1000
@@ -119,6 +126,11 @@ def test_query(store, data_definition):
     assert results[3] == records[3]
     assert results[4] == records[4]
     assert results[5] == records[12]
+
+    results = list(datastream[4:].query(query))
+    assert len(results) == 2
+    assert results[0] == records[4]
+    assert results[1] == records[12]
 
 
 def test_record___getitem__(data_definition):

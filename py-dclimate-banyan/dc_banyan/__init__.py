@@ -63,6 +63,15 @@ class Datastream(_PrivateWrapper):
     def query(self, query):
         return iter(self._inner.query(query))
 
+    def __getitem__(self, index):
+        if isinstance(index, slice) and index.step is None:
+            return Datastream(_PRIVATE, self._inner.slice(index.start, index.stop))
+
+        elif isinstance(index, int):
+            return self._inner.slice(index, index + 1).collect()[0]
+
+        raise NotImplementedError
+
 
 def Enum(options: typing.Sequence[str]):
     return list(options)

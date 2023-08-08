@@ -139,6 +139,14 @@ pub struct DatastreamView<'ds, S: BanyanStore> {
 }
 
 impl<'ds, S: BanyanStore> DatastreamView<'ds, S> {
+    pub fn new(datastream: &'ds Datastream<S>, start: Option<u64>, end: Option<u64>) -> Self {
+        Self {
+            datastream,
+            start,
+            end,
+        }
+    }
+
     pub fn slice(&self, start: u64, end: u64) -> Self {
         let (start, end) = match self.start {
             Some(view_start) => (Some(view_start + start), Some(view_start + end)),

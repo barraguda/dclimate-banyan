@@ -4,7 +4,7 @@ use chrono::NaiveDateTime;
 use dclimate_banyan::{DataDefinition, IpfsStore, MemStore, Record, Value};
 use libipld::{multibase::Base, Cid};
 use pyo3::{
-    exceptions::{PyKeyError, PyValueError},
+    exceptions::{PyKeyError, PyNotImplementedError, PyValueError},
     prelude::*,
     pyclass::CompareOp,
     types::PySequence,
@@ -39,11 +39,11 @@ pub fn new_datastream(store: &PyStore, dd: &PyDataDefinition) -> PyDatastream {
     match &store.0 {
         StoreInner::Ipfs(store) => {
             let datastream = dclimate_banyan::Datastream::new(store.clone(), dd.0.clone());
-            PyDatastream(DatastreamInner::Ipfs(datastream))
+            PyDatastream::wrap(DatastreamInner::Ipfs(datastream))
         }
         StoreInner::Memory(store) => {
             let datastream = dclimate_banyan::Datastream::new(store.clone(), dd.0.clone());
-            PyDatastream(DatastreamInner::Memory(datastream))
+            PyDatastream::wrap(DatastreamInner::Memory(datastream))
         }
     }
 }
@@ -59,17 +59,21 @@ pub fn load_datastream(
     match &store.0 {
         StoreInner::Ipfs(store) => {
             let datastream = dclimate_banyan::Datastream::load(&cid, store.clone(), dd.0.clone());
-            Ok(PyDatastream(DatastreamInner::Ipfs(datastream)))
+            Ok(PyDatastream::wrap(DatastreamInner::Ipfs(datastream)))
         }
         StoreInner::Memory(store) => {
             let datastream = dclimate_banyan::Datastream::load(&cid, store.clone(), dd.0.clone());
-            Ok(PyDatastream(DatastreamInner::Memory(datastream)))
+            Ok(PyDatastream::wrap(DatastreamInner::Memory(datastream)))
         }
     }
 }
 
 #[pyclass]
-pub struct PyDatastream(DatastreamInner);
+pub struct PyDatastream {
+    inner: DatastreamInner,
+    start: Option<u64>,
+    end: Option<u64>,
+}
 
 #[derive(Clone)]
 enum DatastreamInner {
@@ -77,11 +81,21 @@ enum DatastreamInner {
     Memory(dclimate_banyan::Datastream<MemStore>),
 }
 
+impl PyDatastream {
+    fn wrap(inner: DatastreamInner) -> Self {
+        Self {
+            inner,
+            start: None,
+            end: None,
+        }
+    }
+}
+
 #[pymethods]
 impl PyDatastream {
     #[getter]
     pub fn cid(&self) -> Option<String> {
-        let cid = match &self.0 {
+        let cid = match &self.inner {
             DatastreamInner::Ipfs(ds) => ds.cid,
             DatastreamInner::Memory(ds) => ds.cid,
         };
@@ -90,7 +104,11 @@ impl PyDatastream {
     }
 
     pub fn extend(&self, pyrecords: &PySequence) -> PyResult<Self> {
-        match &self.0 {
+        if self.start.is_some() || self.end.is_some() {
+            return Err(PyNotImplementedError::new_err("Cannot extend a slice"));
+        }
+
+        match &self.inner {
             DatastreamInner::Ipfs(datastream) => {
                 let records = pyrecords
                     .iter()?
@@ -103,7 +121,7 @@ impl PyDatastream {
                     .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
 
                 let datastream = datastream.clone().extend(records)?;
-                Ok(Self(DatastreamInner::Ipfs(datastream)))
+                Ok(Self::wrap(DatastreamInner::Ipfs(datastream)))
             }
             DatastreamInner::Memory(datastream) => {
                 let records = pyrecords
@@ -117,15 +135,16 @@ impl PyDatastream {
                     .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
 
                 let datastream = datastream.clone().extend(records)?;
-                Ok(Self(DatastreamInner::Memory(datastream)))
+                Ok(Self::wrap(DatastreamInner::Memory(datastream)))
             }
         }
     }
 
     pub fn collect(&self) -> PyResult<Vec<PyRecord>> {
-        match &self.0 {
+        match &self.inner {
             DatastreamInner::Ipfs(datastream) => {
-                let records = datastream
+                let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
+                let records = view
                     .iter()?
                     .map(|r| r.map(PyRecord::wrap))
                     .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
@@ -133,7 +152,8 @@ impl PyDatastream {
                 Ok(records)
             }
             DatastreamInner::Memory(datastream) => {
-                let records = datastream
+                let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
+                let records = view
                     .iter()?
                     .map(|r| r.map(PyRecord::wrap))
                     .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
@@ -144,9 +164,10 @@ impl PyDatastream {
     }
 
     pub fn query(&self, query: &PyQuery) -> PyResult<Vec<PyRecord>> {
-        match &self.0 {
+        match &self.inner {
             DatastreamInner::Ipfs(datastream) => {
-                let records = datastream
+                let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
+                let records = view
                     .query(&query.0)?
                     .map(|r| r.map(PyRecord::wrap))
                     .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
@@ -154,13 +175,38 @@ impl PyDatastream {
                 Ok(records)
             }
             DatastreamInner::Memory(datastream) => {
-                let records = datastream
+                let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
+                let records = view
                     .query(&query.0)?
                     .map(|r| r.map(PyRecord::wrap))
                     .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
 
                 Ok(records)
             }
+        }
+    }
+
+    pub fn slice(&self, start: Option<u64>, end: Option<u64>) -> Self {
+        let start = match self.start {
+            Some(prev_start) => match start {
+                Some(new_start) => Some(prev_start + new_start),
+                None => Some(prev_start),
+            },
+            None => start,
+        };
+
+        let end = match self.start {
+            Some(prev_start) => match end {
+                Some(new_end) => Some(prev_start + new_end),
+                None => self.end,
+            },
+            None => end,
+        };
+
+        Self {
+            inner: self.inner.clone(),
+            start,
+            end,
         }
     }
 }

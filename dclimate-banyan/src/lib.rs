@@ -12,7 +12,7 @@ use banyan_utils::tags::Sha256Digest;
 pub use banyan_utils::ipfs::IpfsStore;
 
 pub use data_definition::{ColumnDefinition, ColumnType, DataDefinition, Record};
-pub use datastream::Datastream;
+pub use datastream::{Datastream, DatastreamView};
 pub use error::{ConversionError, Result};
 pub use query::Query;
 pub use value::Value;
