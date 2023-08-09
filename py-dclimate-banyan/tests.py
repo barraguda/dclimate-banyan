@@ -174,3 +174,16 @@ def test_as_dict(data_definition):
         "ts": datetime.datetime(1969, 12, 31, 19, 0),
         "two": 0,
     }
+
+
+def test_column_definition_getters(data_definition):
+    assert data_definition["ts"].name == "ts"
+    assert data_definition["ts"].type == dc_banyan.Timestamp
+    assert data_definition["ts"].index
+
+    assert data_definition["two"].type == dc_banyan.Integer
+    assert not data_definition["two"].index
+
+    assert data_definition["three"].type == dc_banyan.Float
+    assert data_definition["five"].type == dc_banyan.String
+    assert data_definition["seven"].type == dc_banyan.Enum(["foo", "bar", "baz"])

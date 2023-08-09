@@ -14,7 +14,6 @@ const TIMESTAMP: u8 = 0;
 const INTEGER: u8 = 1;
 const FLOAT: u8 = 2;
 const STRING: u8 = 3;
-const ENUM_COL: u8 = 4;
 
 #[pyfunction]
 pub fn ipfs_available() -> bool {
@@ -313,15 +312,25 @@ impl PyColumnDefinition {
         })
     }
 
+    #[getter]
+    fn name(&self) -> String {
+        self.0.name.clone()
+    }
+
     #[getter(type)]
-    fn kind(&self) -> u8 {
-        match self.0.kind {
-            dclimate_banyan::ColumnType::Timestamp => TIMESTAMP,
-            dclimate_banyan::ColumnType::Integer => INTEGER,
-            dclimate_banyan::ColumnType::Float => FLOAT,
-            dclimate_banyan::ColumnType::String => STRING,
-            dclimate_banyan::ColumnType::Enum(_) => ENUM_COL,
+    fn kind(&self, py: Python) -> PyObject {
+        match &self.0.kind {
+            dclimate_banyan::ColumnType::Timestamp => TIMESTAMP.into_py(py),
+            dclimate_banyan::ColumnType::Integer => INTEGER.into_py(py),
+            dclimate_banyan::ColumnType::Float => FLOAT.into_py(py),
+            dclimate_banyan::ColumnType::String => STRING.into_py(py),
+            dclimate_banyan::ColumnType::Enum(options) => options.clone().into_py(py),
         }
+    }
+
+    #[getter]
+    fn index(&self) -> bool {
+        self.0.index
     }
 }
 
