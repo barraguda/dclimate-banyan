@@ -187,3 +187,18 @@ def test_column_definition_getters(data_definition):
     assert data_definition["three"].type == dc_banyan.Float
     assert data_definition["five"].type == dc_banyan.String
     assert data_definition["seven"].type == dc_banyan.Enum(["foo", "bar", "baz"])
+
+
+def test_data_definition_iter(data_definition):
+    assert [col.name for col in data_definition] == [
+        "ts",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+    ]

@@ -267,6 +267,13 @@ impl PyDataDefinition {
     pub fn __repr__(&self) -> String {
         format!("{:?}", self.0)
     }
+
+    pub fn columns(&self) -> Vec<PyColumnDefinition> {
+        self.0
+            .columns()
+            .map(|col| PyColumnDefinition(col.clone()))
+            .collect()
+    }
 }
 
 pub type ColumnSpec = (String, PyColumnType, bool);

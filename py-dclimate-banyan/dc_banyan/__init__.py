@@ -53,6 +53,12 @@ class DataDefinition:
     def __repr__(self):
         return repr(self._inner)
 
+    def columns(self):
+        return self._inner.columns()
+
+    def __iter__(self):
+        return iter(self.columns())
+
 
 class Datastream(_PrivateWrapper):
     @property
