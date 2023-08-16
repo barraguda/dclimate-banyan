@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, str::FromStr};
 
 use chrono::NaiveDateTime;
-use dclimate_banyan::{DataDefinition, IpfsStore, MemStore, Record, Value};
+use dclimate_banyan::{DataDefinition, IpfsStore, MemStore, Value};
 use libipld::{multibase::Base, Cid};
 use pyo3::{
     exceptions::{PyKeyError, PyNotImplementedError, PyValueError},
@@ -14,8 +14,17 @@ const TIMESTAMP: u8 = 0;
 const INTEGER: u8 = 1;
 const FLOAT: u8 = 2;
 const STRING: u8 = 3;
+const ENUM: u8 = 4;
 
 #[pyfunction]
+/// Checks to see if there is an IPFS node running locally.
+///
+/// The IPFS store can only be used if this function returns `True`. Otherwise, a memory
+/// store must be used which is really only useful for testing.
+///
+/// Returns:
+///     `True` if IPFS is available locally, `False` otherwise.
+///
 pub fn ipfs_available() -> bool {
     dclimate_banyan::ipfs_available()
 }
@@ -40,16 +49,40 @@ impl PyStore {
 }
 
 #[pyfunction]
+/// Creates and returns a Store which uses a locally running IPFS node
+///
+/// Returns:
+///     An IPFS Store implementation.
+///
 pub fn ipfs_store() -> PyStore {
     PyStore(StoreInner::Ipfs(IpfsStore))
 }
 
 #[pyfunction]
+/// Creates and returns a Store which uses local memory
+///
+/// This is convenient for testing but otherwise not particularly useful, as any data written is
+/// lost whenever the program ends.
+///
+/// Returns:
+///     An in-memory store implementation.
+///
 pub fn memory_store(max_size: usize) -> PyStore {
     PyStore(StoreInner::Memory(dclimate_banyan::memory_store(max_size)))
 }
 
 #[pyfunction]
+/// Initialize a new, empty datastream.
+///
+/// Args:
+///     store (Store): A store object such as that returned from :func:`ipfs_store` or
+///         :func:`memory_store`.
+///     data_definition (DataDefinition): The data definition for the data to be stored in the
+///         datastream.
+///
+/// Returns:
+///     :class:`Datastream`: An empty datastream, ready to receive data.
+///
 pub fn new_datastream(store: &PyStore, dd: &PyDataDefinition) -> PyDatastream {
     match &store.0 {
         StoreInner::Ipfs(store) => {
@@ -64,6 +97,20 @@ pub fn new_datastream(store: &PyStore, dd: &PyDataDefinition) -> PyDatastream {
 }
 
 #[pyfunction]
+/// Loads a datastream from the given store with the given content identifier (cid).
+///
+/// Args:
+///     cid (str): The content identifier of the datastream to retreive.
+///
+///     store (Store): A store object such as that returned from :func:`ipfs_store` or
+///         :func:`memory_store`.
+///     data_definition (DataDefinition): The data definition for the data to be stored in the
+///         datastream.
+///
+/// Returns:
+///     :class:`Datastream`: The loaded datastream. The datastram is ready to be read, queried, or
+///         appended to.
+///
 pub fn load_datastream(
     cid: &str,
     store: &PyStore,
@@ -128,12 +175,15 @@ impl PyDatastream {
                 let records = pyrecords
                     .iter()?
                     .map(|o| {
-                        let pyrecord: PyRecord = o?.extract()?;
-                        let record = Record::new(&datastream.data_definition, pyrecord.values);
+                        let pyrecord: Record = o?.extract()?;
+                        let record = dclimate_banyan::Record::new(
+                            &datastream.data_definition,
+                            pyrecord.values,
+                        );
 
                         Ok(record)
                     })
-                    .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
+                    .collect::<dclimate_banyan::Result<Vec<dclimate_banyan::Record>>>()?;
 
                 let datastream = datastream.clone().extend(records)?;
                 Ok(Self::wrap(DatastreamInner::Ipfs(datastream)))
@@ -142,12 +192,15 @@ impl PyDatastream {
                 let records = pyrecords
                     .iter()?
                     .map(|o| {
-                        let pyrecord: PyRecord = o?.extract()?;
-                        let record = Record::new(&datastream.data_definition, pyrecord.values);
+                        let pyrecord: Record = o?.extract()?;
+                        let record = dclimate_banyan::Record::new(
+                            &datastream.data_definition,
+                            pyrecord.values,
+                        );
 
                         Ok(record)
                     })
-                    .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
+                    .collect::<dclimate_banyan::Result<Vec<dclimate_banyan::Record>>>()?;
 
                 let datastream = datastream.clone().extend(records)?;
                 Ok(Self::wrap(DatastreamInner::Memory(datastream)))
@@ -155,14 +208,14 @@ impl PyDatastream {
         }
     }
 
-    pub fn collect(&self) -> PyResult<Vec<PyRecord>> {
+    pub fn collect(&self) -> PyResult<Vec<Record>> {
         match &self.inner {
             DatastreamInner::Ipfs(datastream) => {
                 let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
                 let records = view
                     .iter()?
-                    .map(|r| r.map(PyRecord::wrap))
-                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+                    .map(|r| r.map(Record::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
 
                 Ok(records)
             }
@@ -170,22 +223,22 @@ impl PyDatastream {
                 let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
                 let records = view
                     .iter()?
-                    .map(|r| r.map(PyRecord::wrap))
-                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+                    .map(|r| r.map(Record::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
 
                 Ok(records)
             }
         }
     }
 
-    pub fn query(&self, query: &PyQuery) -> PyResult<Vec<PyRecord>> {
+    pub fn query(&self, query: &Query) -> PyResult<Vec<Record>> {
         match &self.inner {
             DatastreamInner::Ipfs(datastream) => {
                 let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
                 let records = view
                     .query(&query.0)?
-                    .map(|r| r.map(PyRecord::wrap))
-                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+                    .map(|r| r.map(Record::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
 
                 Ok(records)
             }
@@ -193,8 +246,8 @@ impl PyDatastream {
                 let view = dclimate_banyan::DatastreamView::new(datastream, self.start, self.end);
                 let records = view
                     .query(&query.0)?
-                    .map(|r| r.map(PyRecord::wrap))
-                    .collect::<dclimate_banyan::Result<Vec<PyRecord>>>()?;
+                    .map(|r| r.map(Record::wrap))
+                    .collect::<dclimate_banyan::Result<Vec<Record>>>()?;
 
                 Ok(records)
             }
@@ -253,8 +306,8 @@ impl PyDataDefinition {
         Self(dd)
     }
 
-    pub fn record(&self) -> PyRecord {
-        PyRecord::new(self.0.clone())
+    pub fn record(&self) -> Record {
+        Record::new(self.0.clone())
     }
 
     pub fn get_by_name(&self, name: &str) -> PyResult<PyColumnDefinition> {
@@ -308,14 +361,14 @@ pub struct PyColumnDefinition(dclimate_banyan::ColumnDefinition);
 
 #[pymethods]
 impl PyColumnDefinition {
-    fn __richcmp__(&self, other: PyValue, op: CompareOp) -> PyResult<PyQuery> {
+    fn __richcmp__(&self, other: PyValue, op: CompareOp) -> PyResult<Query> {
         Ok(match op {
-            CompareOp::Lt => PyQuery(self.0.lt(other.into())?),
-            CompareOp::Le => PyQuery(self.0.le(other.into())?),
-            CompareOp::Eq => PyQuery(self.0.eq(other.into())?),
-            CompareOp::Ne => PyQuery(self.0.ne(other.into())?),
-            CompareOp::Gt => PyQuery(self.0.gt(other.into())?),
-            CompareOp::Ge => PyQuery(self.0.ge(other.into())?),
+            CompareOp::Lt => Query(self.0.lt(other.into())?),
+            CompareOp::Le => Query(self.0.le(other.into())?),
+            CompareOp::Eq => Query(self.0.eq(other.into())?),
+            CompareOp::Ne => Query(self.0.ne(other.into())?),
+            CompareOp::Gt => Query(self.0.gt(other.into())?),
+            CompareOp::Ge => Query(self.0.ge(other.into())?),
         })
     }
 
@@ -339,44 +392,59 @@ impl PyColumnDefinition {
     fn index(&self) -> bool {
         self.0.index
     }
+
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.0)
+    }
 }
 
 #[pyclass]
-pub struct PyQuery(dclimate_banyan::Query);
+/// An object representing a query of a Datastream.
+///
+/// A `Query` object is created when a :class:`ColumnDefinition` is compared to a value.
+///
+/// .. doctest::
+///     :pyversion: ~= 3.9
+///
+///     >>> timestamp = data_definition["ts"]
+///     >>> timestamp >= datetime(2010, 5, 12, 2, 42)
+///     Query { clauses: [QueryAnd { clauses: [QueryCol { operator: GE, position: 0, value: Timestamp(1273632120) }] }] }
+///
+/// Queries can be combined using AND and OR logic using the bitwise `&` (and) and `|` (or)
+/// operators. (The boolean operators `or` and `and` cannot be overridden in Python.)
+///
+///     >>> (timestamp >= datetime(2010, 5, 12, 2, 42)) & (timestamp < datetime(2015, 5, 12, 2, 42))
+///     Query { clauses: [QueryAnd { clauses: [QueryCol { operator: GE, position: 0, value: Timestamp(1273632120) }, QueryCol { operator: LT, position: 0, value: Timestamp(1431398520) }] }] }
+///     >>> (data_definition["one"] == 42) | (data_definition["two"] == 3.141592)
+///     Query { clauses: [QueryAnd { clauses: [QueryCol { operator: EQ, position: 1, value: Integer(42) }] }, QueryAnd { clauses: [QueryCol { operator: EQ, position: 2, value: Float(3.141592) }] }] }
+///
+/// `Query` objects are passed to :meth:`Datastream.query` in order to query a datastream.
+///
+/// .. doctest::
+///     :pyversion: ~= 3.9
+///
+///     >>> dec_2001 = (
+///     ...     (timestamp >= datetime(2001, 12, 1, 0, 0)) &
+///     ...     (timestamp < datetime(2002, 1, 1, 0, 0))
+///     ... )
+///     >>> query = dec_2001 & (data_definition["two"] > 2290.0)
+///     >>> results = datastream.query(query)
+///     >>> [record.as_dict() for record in results]
+///     [{'one': 729, 'ts': datetime.datetime(2001, 12, 30, 0, 0), 'two': 2290.220568}, {'one': 730, 'ts': datetime.datetime(2001, 12, 31, 0, 0), 'two': 2293.36216}]
+pub struct Query(dclimate_banyan::Query);
 
 #[pymethods]
-impl PyQuery {
+impl Query {
     fn __or__(&self, other: &Self) -> Self {
-        PyQuery(self.0.clone().or(other.0.clone()))
+        Query(self.0.clone().or(other.0.clone()))
     }
 
     fn __and__(&self, other: &Self) -> Self {
-        PyQuery(self.0.clone().and(other.0.clone()))
-    }
-}
-
-#[pyclass(mapping)]
-#[derive(Clone, Debug, PartialEq)]
-pub struct PyRecord {
-    data_definition: dclimate_banyan::DataDefinition,
-    values: BTreeMap<String, dclimate_banyan::Value>,
-}
-
-impl PyRecord {
-    fn new(data_definition: DataDefinition) -> Self {
-        let values = BTreeMap::new();
-
-        Self {
-            data_definition,
-            values,
-        }
+        Query(self.0.clone().and(other.0.clone()))
     }
 
-    fn wrap(record: Record) -> Self {
-        Self {
-            data_definition: record.data_definition.clone(),
-            values: record.values,
-        }
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.0)
     }
 }
 
@@ -389,8 +457,69 @@ fn value_to_py(value: &Value, py: Python) -> PyObject {
     }
 }
 
+#[pyclass(mapping)]
+#[derive(Clone, Debug, PartialEq)]
+/// Represents a single row of data in a datastream.
+///
+/// A datastream is composed of and retrieves instances of `Record`. A `Record` instance is
+/// backed by the :class:`DataDefinition` of the associated :class:`Datastream`. Use the
+/// :class:`DataDefinition` to create a new record.
+///
+/// .. doctest::
+///     :pyversion: ~= 3.9
+///
+///     >>> record = data_definition.record()
+///     >>> record
+///     Record { data_definition: DataDefinition([ColumnDefinition { position: 0, name: "ts", kind: Timestamp, index: true }, ColumnDefinition { position: 1, name: "one", kind: Integer, index: false }, ColumnDefinition { position: 2, name: "two", kind: Float, index: true }, ColumnDefinition { position: 3, name: "three", kind: String, index: false }, ColumnDefinition { position: 4, name: "four", kind: Enum(["foo", "bar", "baz"]), index: false }]), values: {} }
+///
+/// Fields on records may be set and read using regular item syntax.
+///
+/// .. doctest::
+///     :pyversion: ~= 3.9
+///
+///     >>> record["one"] = 42
+///     >>> record["one"]
+///     42
+///     >>> del record["one"]
+///     >>> record["one"]
+///     Traceback (most recent call last):
+///       ...
+///     KeyError: 'one'
+///
+/// `Record` doesn't fully support the Python `dict` interface, but if you want to use `dict`
+/// methods you can convert a `Record` to a `dict` using :meth:`Record.as_dict`.
+///
+/// .. doctest::
+///     :pyversion: ~= 3.9
+///
+///    >>> record = data_definition.record({"one": 56, "two": 2.71828})
+///    >>> record.as_dict()
+///    {'one': 56, 'two': 2.71828}
+pub struct Record {
+    data_definition: dclimate_banyan::DataDefinition,
+    values: BTreeMap<String, dclimate_banyan::Value>,
+}
+
+impl Record {
+    fn new(data_definition: DataDefinition) -> Self {
+        let values = BTreeMap::new();
+
+        Self {
+            data_definition,
+            values,
+        }
+    }
+
+    fn wrap(record: dclimate_banyan::Record) -> Self {
+        Self {
+            data_definition: record.data_definition.clone(),
+            values: record.values,
+        }
+    }
+}
+
 #[pymethods]
-impl PyRecord {
+impl Record {
     fn __getitem__(&self, key: String, py: Python) -> PyResult<PyObject> {
         match self.values.get(&key) {
             None => Err(PyKeyError::new_err(key)),
@@ -428,6 +557,11 @@ impl PyRecord {
         format!("{:?}", self)
     }
 
+    /// Returns the values held by this record as a regular Python dictionary.
+    ///
+    /// Returns:
+    ///     A Python dictionary using column names as keys with values from this record.
+    ///
     fn as_dict<'py>(&self, py: Python<'py>) -> &'py PyDict {
         self.values
             .iter()
@@ -479,9 +613,11 @@ fn _banyan(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add("Integer", INTEGER)?;
     m.add("Float", FLOAT)?;
     m.add("String", STRING)?;
+    m.add("Enum", ENUM)?;
 
     m.add_class::<PyDataDefinition>()?;
-    m.add_class::<PyRecord>()?;
+    m.add_class::<Query>()?;
+    m.add_class::<Record>()?;
 
     Ok(())
 }
