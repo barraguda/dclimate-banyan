@@ -18,3 +18,4 @@ module-name = "dc_banyan._banyan"
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-cov"]
+doc = ["sphinx"]

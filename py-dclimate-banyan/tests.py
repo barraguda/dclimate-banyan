@@ -17,10 +17,10 @@ def data_definition():
             ("four", dc_banyan.Float, False),
             ("five", dc_banyan.String, True),
             ("six", dc_banyan.String, False),
-            # ("seven", dc_banyan.Enum(("foo", "bar", "baz")), True),
-            # ("eight", dc_banyan.Enum(("boo", "far", "faz")), True),
-            ("seven", dc_banyan.Enum(("foo", "bar", "baz")), False),
-            ("eight", dc_banyan.Enum(("boo", "far", "faz")), False),
+            # ("seven", dc_banyan.Enum("foo", "bar", "baz"), True),
+            # ("eight", dc_banyan.Enum("boo", "far", "faz"), True),
+            ("seven", dc_banyan.Enum("foo", "bar", "baz"), False),
+            ("eight", dc_banyan.Enum("boo", "far", "faz"), False),
             ("nine", dc_banyan.Timestamp, False),
         )
     )
@@ -186,7 +186,7 @@ def test_column_definition_getters(data_definition):
 
     assert data_definition["three"].type == dc_banyan.Float
     assert data_definition["five"].type == dc_banyan.String
-    assert data_definition["seven"].type == dc_banyan.Enum(["foo", "bar", "baz"])
+    assert data_definition["seven"].type == dc_banyan.Enum("foo", "bar", "baz")
 
 
 def test_data_definition_iter(data_definition):

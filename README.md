@@ -13,10 +13,16 @@ may not work at this time.
 Then:
 
     $ pip install -U pip setuptools
-    $ pip install -e py-dclimate-banyan[dev]
+    $ pip install -e py-dclimate-banyan[dev,doc]
     $ cd python-example
     $ python example.py
 
+To build the documentation:
+
+    $ cd doc
+    $ make html
+
 When this package sees a release, binary wheels will be available containing
 compiled Rust code, so a Rust toolchain will not be needed to use released
-versions of the library.
+versions of the library. Also, built documentation will probably be published
+somewhere like [Read The Docs](https://about.readthedocs.com/).
