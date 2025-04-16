@@ -4,4 +4,5 @@ members = [
     "dclimate-banyan",
     "py-dclimate-banyan",
     "rust-example",
+    "rust-example-column",
 ]

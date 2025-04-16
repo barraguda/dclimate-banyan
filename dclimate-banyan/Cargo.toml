@@ -11,5 +11,6 @@ banyan = { git="https://github.com/Actyx/banyan.git" }
 banyan-utils = { git="https://github.com/Actyx/banyan.git" }
 cbor-data = { version="0.8", features = ["derive"] }
 chrono = "0.4"
-libipld = "0.14"
+libipld = { version = "0.14", features = ["derive"] }
+either = "1.8" 
 thiserror = "1.0"

@@ -1,66 +1,59 @@
+use crate::{
+    // Import types needed for both row-based and columnar queries
+    codec::{SummaryValue, TreeKey, TreeSummary, TreeType, TreeValue},
+    // Removed TreeType import as it's specific to row-based
+    columnar::{ColumnarSummary, ColumnarTT}, // Import ColumnarTT for trait impl
+    error::Result,        // Keep Result if needed by methods
+};
+use banyan::{
+    index::{BranchIndex, LeafIndex}, // Keep necessary index types
+    query::Query as BanyanApiQuery,  // Alias banyan's Query trait
+};
 use std::cmp::{max, min, Ordering};
-
-use crate::codec::{SummaryValue, TreeKey, TreeSummary, TreeType, TreeValue};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Comparison {
-    LT,
-    LE,
-    EQ,
-    NE,
-    GE,
-    GT,
+    LT, LE, EQ, NE, GE, GT,
 }
-
 pub(crate) use Comparison::*;
 
+// --- User-Facing Query Structure ---
+// This structure remains the same for the user to build queries.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Query {
+    // Disjunctive Normal Form (OR of ANDs)
     clauses: Vec<QueryAnd>,
 }
 
 impl Query {
-    pub(crate) fn new(position: usize, operator: Comparison, value: TreeValue) -> Query {
+    // Constructor remains public
+    pub fn new(position: usize, operator: Comparison, value: TreeValue) -> Query {
         let query = QueryCol {
             position,
             operator,
             value,
         };
-
         let query = QueryAnd {
             clauses: vec![query],
         };
-
         Query {
             clauses: vec![query],
         }
     }
 
-    fn eval_scalar(&self, value: &TreeKey) -> bool {
-        self.clauses.iter().any(|clause| clause.eval_scalar(value))
-    }
-
-    fn eval_summary(&self, summary: &TreeSummary) -> bool {
-        self.clauses
-            .iter()
-            .any(|clause| clause.eval_summary(summary))
-    }
-
+    // Keep and/or public, return Result for potential errors during combination?
+    // For simplicity, keeping them infallible for now.
     pub fn and(self, other: Query) -> Self {
-        // (A || B) && (C || D) => (A && C) || (B && C) || (A && D) || (B && D)
         let mut or_clauses = vec![];
-
         for left in &self.clauses {
             for right in &other.clauses {
                 let mut and_clauses = left.clauses.clone();
                 and_clauses.extend(right.clauses.clone());
-
                 or_clauses.push(QueryAnd {
                     clauses: and_clauses,
                 });
             }
         }
-
         Self {
             clauses: or_clauses,
         }
@@ -68,8 +61,27 @@ impl Query {
 
     pub fn or(mut self, other: Query) -> Self {
         self.clauses.extend(other.clauses);
-
         self
+    }
+
+    // --- Evaluation Helpers (pub(crate)) ---
+    // Evaluate against a single row (TreeKey = Row for row-based)
+    pub(crate) fn eval_scalar(&self, value: &crate::codec::Row) -> bool {
+        self.clauses.iter().any(|clause| clause.eval_scalar(value))
+    }
+
+    // Evaluate against a row-based summary
+    pub(crate) fn eval_summary(&self, summary: &TreeSummary) -> bool {
+        self.clauses
+            .iter()
+            .any(|clause| clause.eval_summary(summary))
+    }
+
+    // Evaluate against a columnar summary
+    pub(crate) fn eval_columnar_summary(&self, summary: &ColumnarSummary) -> bool {
+        self.clauses
+            .iter()
+            .any(|clause| clause.eval_columnar_summary(summary))
     }
 }
 
@@ -79,14 +91,21 @@ struct QueryAnd {
 }
 
 impl QueryAnd {
-    fn eval_scalar(&self, value: &TreeKey) -> bool {
+    // Evaluate against a single row (TreeKey = Row for row-based)
+    pub(crate) fn eval_scalar(&self, value: &crate::codec::Row) -> bool {
         self.clauses.iter().all(|clause| clause.eval_scalar(value))
     }
-
-    fn eval_summary(&self, summary: &TreeSummary) -> bool {
+    // Evaluate against a row-based summary
+    pub(crate) fn eval_summary(&self, summary: &TreeSummary) -> bool {
         self.clauses
             .iter()
             .all(|clause| clause.eval_summary(summary))
+    }
+    // Evaluate against a columnar summary
+    pub(crate) fn eval_columnar_summary(&self, summary: &ColumnarSummary) -> bool {
+        self.clauses
+            .iter()
+            .all(|clause| clause.eval_columnar_summary(summary))
     }
 }
 
@@ -98,183 +117,144 @@ struct QueryCol {
 }
 
 impl QueryCol {
-    fn eval_scalar(&self, row: &TreeKey) -> bool {
+    // Evaluate against a single row (TreeKey = Row for row-based)
+    pub(crate) fn eval_scalar(&self, row: &crate::codec::Row) -> bool {
         match row.get(self.position) {
-            Some(value) => match self.operator {
-                LE => *value <= self.value,
-                LT => *value < self.value,
-                EQ => *value == self.value,
-                NE => *value != self.value,
-                GT => *value > self.value,
-                GE => *value >= self.value,
-            },
-            None => false,
+            Some(value) => self.compare_value(value),
+            None => self.operator == NE, // Treat missing as not equal only if NE
+        }
+    }
+    // Evaluate against a row-based summary
+    pub(crate) fn eval_summary(&self, summary: &TreeSummary) -> bool {
+        match summary.get(self.position) {
+            Some(summary_val) => self.compare_summary(summary_val),
+            None => false, // Column not present in summary range
+        }
+    }
+    // Evaluate against a columnar summary
+    pub(crate) fn eval_columnar_summary(&self, summary: &ColumnarSummary) -> bool {
+        match summary.get_column_summary(self.position) {
+            Some(summary_val) => self.compare_summary(summary_val),
+            None => false, // Column not present in this columnar summary
         }
     }
 
-    fn eval_summary(&self, summary: &TreeSummary) -> bool {
-        match summary.get(self.position) {
-            Some(summary) => match self.operator {
-                LE => *summary <= self.value,
-                LT => *summary < self.value,
-                EQ => *summary == self.value,
-                NE => summary.not_contains_only(&self.value),
-                GT => *summary > self.value,
-                GE => *summary >= self.value,
-            },
-            None => false,
+    // Helper for comparing a TreeValue against the query's value
+    fn compare_value(&self, value: &TreeValue) -> bool {
+        match self.operator {
+            LE => *value <= self.value, LT => *value < self.value,
+            EQ => *value == self.value, NE => *value != self.value,
+            GT => *value > self.value,  GE => *value >= self.value,
+        }
+    }
+
+    // Helper for comparing a SummaryValue against the query's value
+    fn compare_summary(&self, summary_val: &SummaryValue) -> bool {
+        match self.operator {
+            LE => *summary_val <= self.value, LT => *summary_val < self.value,
+            EQ => *summary_val == self.value, NE => summary_val.not_contains_only(&self.value),
+            GT => *summary_val > self.value,  GE => *summary_val >= self.value,
         }
     }
 }
 
+// --- PartialOrd/PartialEq implementations (keep as before) ---
+// (Ensure these are correct and handle type mismatches gracefully)
 impl PartialOrd for TreeValue {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match self {
-            TreeValue::Timestamp(n) => n.partial_cmp(&i64::try_from(other.clone()).unwrap()),
-            TreeValue::Integer(n) => n.partial_cmp(&i64::try_from(other.clone()).unwrap()),
-            TreeValue::Float(n) => n.partial_cmp(&f64::try_from(other.clone()).unwrap()),
-            TreeValue::String(s) => s.partial_cmp(&String::try_from(other.clone()).unwrap()),
-
-            _ => unimplemented!(),
+        match (self, other) {
+            (TreeValue::Timestamp(s), TreeValue::Timestamp(o)) => s.partial_cmp(o),
+            (TreeValue::Integer(s), TreeValue::Integer(o)) => s.partial_cmp(o),
+            (TreeValue::Float(s), TreeValue::Float(o)) => s.partial_cmp(o),
+            (TreeValue::String(s), TreeValue::String(o)) => s.partial_cmp(o),
+            (TreeValue::Enum(s), TreeValue::Enum(o)) => s.partial_cmp(o),
+            _ => None, // Incomparable types
         }
     }
 }
 
 impl PartialEq<TreeValue> for SummaryValue {
-    fn eq(&self, other: &TreeValue) -> bool {
-        match self {
-            SummaryValue::Timestamp(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                !(other < range.lhs || other > range.rhs)
-            }
-            SummaryValue::Integer(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                !(other < range.lhs || other > range.rhs)
-            }
-            SummaryValue::Float(range) => {
-                let other = f64::try_from(other.clone()).unwrap();
-                !(other < range.lhs || other > range.rhs)
-            }
-            SummaryValue::String(range) => {
-                let other = String::try_from(other.clone()).unwrap();
-                !(other < range.lhs || other > range.rhs)
-            }
+     fn eq(&self, other: &TreeValue) -> bool {
+        match (self, other) {
+            (SummaryValue::Timestamp(range), TreeValue::Timestamp(o)) => !(o < &range.lhs || o > &range.rhs),
+            (SummaryValue::Integer(range), TreeValue::Integer(o)) => !(o < &range.lhs || o > &range.rhs),
+            (SummaryValue::Float(range), TreeValue::Float(o)) => !(o < &range.lhs || o > &range.rhs),
+            (SummaryValue::String(range), TreeValue::String(o)) => !(o < &range.lhs || o > &range.rhs),
+            _ => false, // Different types or Enum involved
         }
     }
 }
 
 impl SummaryValue {
-    fn not_contains_only(&self, other: &TreeValue) -> bool {
-        match self {
-            SummaryValue::Timestamp(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                !(other == range.lhs && other == range.rhs)
-            }
-            SummaryValue::Integer(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                !(other == range.lhs && other == range.rhs)
-            }
-            SummaryValue::Float(range) => {
-                let other = f64::try_from(other.clone()).unwrap();
-                !(other == range.lhs && other == range.rhs)
-            }
-            SummaryValue::String(range) => {
-                let other = String::try_from(other.clone()).unwrap();
-                !(other == range.lhs && other == range.rhs)
-            }
+    pub(crate) fn not_contains_only(&self, other: &TreeValue) -> bool {
+         match (self, other) {
+            (SummaryValue::Timestamp(range), TreeValue::Timestamp(o)) => !(o == &range.lhs && o == &range.rhs),
+            (SummaryValue::Integer(range), TreeValue::Integer(o)) => !(o == &range.lhs && o == &range.rhs),
+            (SummaryValue::Float(range), TreeValue::Float(o)) => !(o == &range.lhs && o == &range.rhs),
+            (SummaryValue::String(range), TreeValue::String(o)) => !(o == &range.lhs && o == &range.rhs),
+            _ => true, // Different types cannot be equal
         }
     }
 }
+
 
 impl PartialOrd<TreeValue> for SummaryValue {
     fn partial_cmp(&self, _other: &TreeValue) -> Option<Ordering> {
-        unimplemented!()
+        // This direct comparison is ill-defined for ranges vs single values.
+        // We rely on the specific lt, le, gt, ge methods below.
+        None
     }
 
+    // Does *any part* of the summary range satisfy "less than other"?
+    // True if the lower bound of the range is less than the value.
     fn lt(&self, other: &TreeValue) -> bool {
-        match self {
-            SummaryValue::Timestamp(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.lhs < other
-            }
-            SummaryValue::Integer(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.lhs < other
-            }
-            SummaryValue::Float(range) => {
-                let other = f64::try_from(other.clone()).unwrap();
-                range.lhs < other
-            }
-            SummaryValue::String(range) => {
-                let other = String::try_from(other.clone()).unwrap();
-                range.lhs < other
-            }
+        match (self, other) {
+            (SummaryValue::Timestamp(range), TreeValue::Timestamp(o)) => range.lhs < *o,
+            (SummaryValue::Integer(range), TreeValue::Integer(o)) => range.lhs < *o,
+            (SummaryValue::Float(range), TreeValue::Float(o)) => range.lhs < *o,
+            (SummaryValue::String(range), TreeValue::String(o)) => range.lhs < *o,
+            _ => false, // Type mismatch or Enum
         }
     }
 
+    // Does *any part* of the summary range satisfy "less than or equal to other"?
+    // True if the lower bound of the range is less than or equal to the value.
     fn le(&self, other: &TreeValue) -> bool {
-        match self {
-            SummaryValue::Timestamp(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.lhs <= other
-            }
-            SummaryValue::Integer(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.lhs <= other
-            }
-            SummaryValue::Float(range) => {
-                let other = f64::try_from(other.clone()).unwrap();
-                range.lhs <= other
-            }
-            SummaryValue::String(range) => {
-                let other = String::try_from(other.clone()).unwrap();
-                range.lhs <= other
-            }
+        match (self, other) {
+            (SummaryValue::Timestamp(range), TreeValue::Timestamp(o)) => range.lhs <= *o,
+            (SummaryValue::Integer(range), TreeValue::Integer(o)) => range.lhs <= *o,
+            (SummaryValue::Float(range), TreeValue::Float(o)) => range.lhs <= *o,
+            (SummaryValue::String(range), TreeValue::String(o)) => range.lhs <= *o,
+             _ => false,
         }
     }
 
+    // Does *any part* of the summary range satisfy "greater than other"?
+    // True if the upper bound of the range is greater than the value.
     fn gt(&self, other: &TreeValue) -> bool {
-        match self {
-            SummaryValue::Timestamp(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.rhs > other
-            }
-            SummaryValue::Integer(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.rhs > other
-            }
-            SummaryValue::Float(range) => {
-                let other = f64::try_from(other.clone()).unwrap();
-                range.rhs > other
-            }
-            SummaryValue::String(range) => {
-                let other = String::try_from(other.clone()).unwrap();
-                range.rhs > other
-            }
+         match (self, other) {
+            (SummaryValue::Timestamp(range), TreeValue::Timestamp(o)) => range.rhs > *o,
+            (SummaryValue::Integer(range), TreeValue::Integer(o)) => range.rhs > *o,
+            (SummaryValue::Float(range), TreeValue::Float(o)) => range.rhs > *o,
+            (SummaryValue::String(range), TreeValue::String(o)) => range.rhs > *o,
+             _ => false,
         }
     }
 
+    // Does *any part* of the summary range satisfy "greater than or equal to other"?
+    // True if the upper bound of the range is greater than or equal to the value.
     fn ge(&self, other: &TreeValue) -> bool {
-        match self {
-            SummaryValue::Timestamp(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.rhs >= other
-            }
-            SummaryValue::Integer(range) => {
-                let other = i64::try_from(other.clone()).unwrap();
-                range.rhs >= other
-            }
-            SummaryValue::Float(range) => {
-                let other = f64::try_from(other.clone()).unwrap();
-                range.rhs >= other
-            }
-            SummaryValue::String(range) => {
-                let other = String::try_from(other.clone()).unwrap();
-                range.rhs >= other
-            }
+         match (self, other) {
+            (SummaryValue::Timestamp(range), TreeValue::Timestamp(o)) => range.rhs >= *o,
+            (SummaryValue::Integer(range), TreeValue::Integer(o)) => range.rhs >= *o,
+            (SummaryValue::Float(range), TreeValue::Float(o)) => range.rhs >= *o,
+            (SummaryValue::String(range), TreeValue::String(o)) => range.rhs >= *o,
+             _ => false,
         }
     }
 }
+// 
+
 
 #[derive(Clone, Debug)]
 pub(crate) struct BanyanQuery {
@@ -336,6 +316,155 @@ impl banyan::query::Query<TreeType> for BanyanQuery {
                     None => true,
                 };
             start_index = end_index;
+        }
+    }
+}
+
+
+// --- Banyan Query Implementation for Columnar ---
+// This struct wraps the user query and offset range for Banyan's traversal.
+#[derive(Clone, Debug)]
+pub(crate) struct ColumnarBanyanQuery {
+    pub query: Option<Query>, // User's column query
+    pub range_start: Option<u64>, // Logical row offset start
+    pub range_end: Option<u64>,   // Logical row offset end (exclusive)
+}
+
+// Implement Banyan's Query trait for the *Columnar* TreeType
+impl BanyanApiQuery<ColumnarTT> for ColumnarBanyanQuery {
+    /// Filter leaf index entries (chunk start timestamps).
+    fn containing(
+        &self,
+        offset: u64, // Offset of the *first* row represented by the *first* key in this index node
+        index: &LeafIndex<ColumnarTT>, // Contains VecSeq<i64> (first timestamp of each chunk)
+        res: &mut [bool], // Result mask for the keys in this index node
+    ) {
+        let keys = index.keys.as_ref(); // Vec<i64>
+
+        // We need the *summary* associated with this leaf index to filter accurately.
+        // Banyan's `containing` doesn't provide the leaf's summary directly.
+        // We rely on `intersecting` on the parent branch to do the main filtering.
+        // Here, we can only do a very basic check based on the key itself (first timestamp).
+        // This might let through leaves that `intersecting` would have pruned.
+
+        for i in 0..keys.len().min(res.len()) {
+            if !res[i] { continue; }
+
+            let first_timestamp_in_chunk = keys[i];
+            let mut keep = true; // Assume keep unless proven otherwise
+
+            // 1. Check offset range (only check start condition here)
+            if self.range_start.map_or(false, |start| offset < start) {
+                 // The start of the range this leaf *might* cover is before the query start.
+                 // We can't be sure without the row count, so we keep it for now.
+                 // A stricter check could be done if we had the leaf summary's count.
+            }
+            if self.range_end.map_or(false, |end| offset >= end) {
+                 // The start of the range this leaf *might* cover is already >= the query end.
+                 keep = false;
+            }
+
+
+            // 2. Check time range based on the *first* timestamp (very approximate)
+            if keep {
+                if let Some(user_query) = &self.query {
+                    // Check if *any* clause could possibly match based on the first timestamp
+                    keep = user_query.clauses.iter().any(|and_clause| {
+                        // Check if *all* conditions in the AND clause *could* be met
+                        and_clause.clauses.iter().all(|col_clause| {
+                             if col_clause.position == 0 { // DATE column assumed at position 0
+                                 match &col_clause.value {
+                                     TreeValue::Timestamp(query_ts) => {
+                                         // Can this chunk potentially contain matching timestamps?
+                                         match col_clause.operator {
+                                             // If query wants < X, keep if chunk starts < X
+                                             LT => first_timestamp_in_chunk < *query_ts,
+                                             // If query wants <= X, keep if chunk starts <= X
+                                             LE => first_timestamp_in_chunk <= *query_ts,
+                                             // If query wants == X, keep only if chunk starts == X (strict, needs summary)
+                                             // EQ => first_timestamp_in_chunk == *query_ts,
+                                             // For EQ/NE/GE/GT, we really need the summary range.
+                                             // Keep the chunk optimistically.
+                                             EQ | NE | GE | GT => true,
+                                         }
+                                     },
+                                     _ => true, // Non-timestamp query on DATE column? Keep.
+                                 }
+                             } else {
+                                 true // Non-DATE clauses don't filter based on the key here
+                             }
+                        })
+                    });
+                }
+            }
+
+            res[i] = keep;
+        }
+    }
+
+    /// Filter branch index entries (summaries of children).
+    fn intersecting(
+        &self,
+        offset: u64, // Offset of the first row in the first child covered by this branch index
+        index: &BranchIndex<ColumnarTT>, // Contains VecSeq<ColumnarSummary>
+        res: &mut [bool], // Result mask for the child summaries
+    ) {
+        let summaries = index.summaries.as_ref(); // Vec<ColumnarSummary>
+        let mut current_logical_offset = offset;
+
+        for i in 0..summaries.len().min(res.len()) {
+            if !res[i] {
+                // Update offset even if skipping
+                current_logical_offset += summaries[i].count;
+                continue;
+            }
+
+            let child_summary = &summaries[i];
+            let child_row_count = child_summary.count;
+            let child_logical_end_offset = current_logical_offset + child_row_count;
+
+            // 1. Check offset range overlap
+            let range_overlaps =
+                self.range_start.map_or(true, |start| child_logical_end_offset > start) &&
+                self.range_end.map_or(true, |end| current_logical_offset < end);
+
+            // 2. Check time range overlap (using summary min/max time)
+            let time_overlaps = match &self.query {
+                Some(user_query) => user_query.clauses.iter().any(|and_clause| {
+                     and_clause.clauses.iter().all(|col_clause| {
+                         if col_clause.position == 0 { // DATE column
+                             match &col_clause.value {
+                                 TreeValue::Timestamp(query_ts) => {
+                                     match col_clause.operator {
+                                         LT => child_summary.min_time < *query_ts, // Range starts before
+                                         LE => child_summary.min_time <= *query_ts, // Range starts before or at
+                                         EQ => child_summary.min_time <= *query_ts && child_summary.max_time >= *query_ts, // Range overlaps
+                                         NE => true, // Summary likely contains non-equal values unless min==max==query_ts
+                                         GE => child_summary.max_time >= *query_ts, // Range ends at or after
+                                         GT => child_summary.max_time > *query_ts, // Range ends after
+                                     }
+                                 }
+                                 _ => true, // Non-timestamp query on DATE column? Intersects.
+                             }
+                         } else {
+                             true // Check non-DATE columns using column summaries
+                         }
+                     })
+                }),
+                None => true, // No query means time overlaps
+            };
+
+
+            // 3. Check user query against the child's column summaries
+            let query_intersects = match &self.query {
+                 Some(user_query) => user_query.eval_columnar_summary(child_summary),
+                 None => true, // No query means it intersects
+            };
+
+            res[i] = range_overlaps && time_overlaps && query_intersects;
+
+            // Update offset for the next child
+            current_logical_offset = child_logical_end_offset;
         }
     }
 }

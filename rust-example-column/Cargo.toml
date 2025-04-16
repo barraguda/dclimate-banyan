@@ -1,0 +1,16 @@
+[package]
+name = "rust-example-column"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+chrono = "0.4"
+dclimate-banyan = { path = "../dclimate-banyan" }
+libipld = "0.14"
+csv = "1.2"
+banyan-utils = "0.10.1"
+anyhow = "1.0.97"
+banyan = { git="https://github.com/Actyx/banyan.git" }
+cbor-data = { version="0.8", features = ["derive"] }

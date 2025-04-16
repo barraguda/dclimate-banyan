@@ -5,6 +5,7 @@ mod datastream;
 mod error;
 mod query;
 mod value;
+pub mod columnar;
 
 use banyan::store::{BlockWriter, MemStore as BanyanMemStore, ReadOnlyStore};
 use banyan_utils::tags::Sha256Digest;
@@ -16,6 +17,9 @@ pub use datastream::{Datastream, DatastreamView};
 pub use error::{ConversionError, Result};
 pub use query::Query;
 pub use value::Value;
+
+pub use columnar::{ColumnarDatastream, ColumnarDatastreamView}; // Corrected export
+
 
 pub trait BanyanStore: ReadOnlyStore<Sha256Digest> + BlockWriter<Sha256Digest> + Sized {}
 
