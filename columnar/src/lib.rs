@@ -9,13 +9,12 @@ use banyan::{
 };
 use banyan_utils::tags::Sha256Digest;
 use libipld::{
-    cbor::DagCborCodec,             
+    cbor::DagCborCodec,
     codec::{Decode, Encode},
-    Cid,
-    DagCbor,
+    Cid, DagCbor,
 };
 use roaring::RoaringBitmap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+use serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     collections::BTreeMap,
     fmt::Debug,
@@ -570,6 +569,8 @@ pub mod compression {
 
 // --- Banyan Query Logic ---
 pub mod query {
+    use std::ops::RangeBounds;
+
     use super::types::{ColumnarTreeTypes, RichRangeKey, RichRangeSummary};
     use super::*;
     use crate::Value; // Use the user-facing Value
@@ -602,23 +603,83 @@ pub mod query {
     }
 
     impl Query<ColumnarTreeTypes> for ColumnarBanyanQuery {
-        fn containing(&self, _offset: u64, index: &LeafIndex<ColumnarTreeTypes>, res: &mut [bool]) {
-            let key = &index.keys.first();
-            let key_offset_range = (
-                Bound::Included(key.start_offset),
-                Bound::Excluded(key.start_offset + key.count),
-            );
+        fn containing(
+            &self,
+            _leaf_start_offset: u64,
+            index: &LeafIndex<ColumnarTreeTypes>,
+            res: &mut [bool],
+        ) {
+            // In our design, index.keys should contain exactly one RichRangeKey.
+            // Banyan calls this `containing` potentially with a sub-slice of the logical elements
+            // represented by the key if internal optimizations occur. The length of `res` indicates
+            // how many logical elements (starting from some implicit offset within the chunk) are considered.
+
+            if index.keys.is_empty() {
+                // Should not happen in our design if the leaf exists, but handle defensively.
+                for r in res.iter_mut() {
+                    *r = false;
+                }
+                println!("Warning: containing called on leaf with empty keys");
+                return;
+            }
+
+            // We assume only one key exists per leaf in our design.
+            let key = index.keys.first(); // Get the RichRangeKey for the whole chunk
+
+            // Determine the actual number of elements this `res` slice represents.
+            // This is crucial as Banyan might pass a slice representing only a part of the chunk.
+            // We assume the `_leaf_start_offset` Banyan provides is relative to the beginning of the *entire stream*,
+            // and our `key.start_offset` is the absolute offset of the beginning of *this* chunk.
+            // Therefore, the logical index *within the chunk* corresponding to the start of the `res` slice is
+            // `_leaf_start_offset - key.start_offset`.
+            let chunk_relative_start_index = _leaf_start_offset.saturating_sub(key.start_offset);
+
+            // Pre-calculate if the chunk's time range overlaps the query time range.
             let key_time_range = (
                 Bound::Included(key.min_timestamp_micros),
                 Bound::Included(key.max_timestamp_micros),
             );
+            let time_overlaps = ranges_intersect(self.time_range_micros, key_time_range);
 
-            let overlaps = ranges_intersect(self.offset_range, key_offset_range)
-                && ranges_intersect(self.time_range_micros, key_time_range);
+            // Pre-calculate if the chunk's *overall* offset range overlaps the query offset range.
+            let key_offset_range = (
+                Bound::Included(key.start_offset),
+                Bound::Excluded(key.start_offset + key.count), // Excluded end for range representation
+            );
+            let overall_offset_overlaps = ranges_intersect(self.offset_range, key_offset_range);
 
-            for r in res.iter_mut() {
-                *r &= overlaps;
+            if !time_overlaps || !overall_offset_overlaps {
+                // If the whole chunk is outside the time OR offset range, prune everything in this `res` slice.
+                println!(
+                     "Pruning chunk key {:?} (offset {:?}, time {:?}) - Query offset {:?}, query time {:?}",
+                     key, key_offset_range, key_time_range, self.offset_range, self.time_range_micros
+                 );
+                for r in res.iter_mut() {
+                    *r = false;
+                }
+                return;
             }
+
+            // If the chunk potentially overlaps, check each element represented in `res`.
+            let chunk_abs_start = key.start_offset;
+            for i in 0..res.len() {
+                if res[i] {
+                    // Check if Banyan hasn't already pruned this slot via intersecting
+                    // Calculate the absolute offset for the element `i` within the `res` slice
+                    let element_abs_offset =
+                        chunk_abs_start + chunk_relative_start_index + i as u64;
+
+                    // Check if this specific element's offset falls within the query's offset range.
+                    // Need to import RangeBounds for this method: use std::ops::RangeBounds;
+                    let offset_match = self.offset_range.contains(&element_abs_offset);
+                    // println!("  res_idx {}: chunk_rel_start={}, element_abs_offset={}, offset_match={}", i, chunk_relative_start_index, element_abs_offset, offset_match);
+                    res[i] = offset_match; // Update the result slice based *only* on offset
+                }
+            }
+            println!(
+                "Resulting res for chunk key {:?} (rel_start {}): {:?}",
+                key, chunk_relative_start_index, res
+            );
         }
 
         fn intersecting(
@@ -779,23 +840,19 @@ pub mod manager {
         }
     }
 
-
-
     impl<'de> Deserialize<'de> for SerializableCid {
         fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
         where
             D: Deserializer<'de>, // D is the specific Deserializer being used
         {
             let s = String::deserialize(deserializer)?;
-            Cid::try_from(s)
-                .map(SerializableCid)
-                .map_err(|cid_error| {
-                    // Convert the underlying error to a message string
-                    let msg = format!("Failed to parse CID from string: {}", cid_error);
-                    // Use the ::custom associated function from the Error trait,
-                    // which is implemented by D::Error.
-                    D::Error::custom(msg)
-                })
+            Cid::try_from(s).map(SerializableCid).map_err(|cid_error| {
+                // Convert the underlying error to a message string
+                let msg = format!("Failed to parse CID from string: {}", cid_error);
+                // Use the ::custom associated function from the Error trait,
+                // which is implemented by D::Error.
+                D::Error::custom(msg)
+            })
         }
     }
     // Simple state persistence (replace with proper serialization/storage)
@@ -1154,158 +1211,299 @@ pub mod iterator {
 
         // Load and decompress the next set of aligned chunks covering the target_offset
         fn load_next_chunk(&mut self, target_offset: u64) -> Result<bool> {
+            println!(
+                "load_next_chunk(target_offset={}) - Current state: offset={}, range={:?}",
+                target_offset, self.current_absolute_offset, self.current_chunk_range
+            );
+
             self.current_decompressed_chunk_cache.clear();
             let mut anchor_range: Option<Range<u64>> = None;
             let mut anchor_key: Option<RichRangeKey> = None;
-            let mut next_candidate_start = u64::MAX; // Earliest start >= target_offset
-            let mut advance_target = target_offset; // If we fail, where should we jump to?
-        
-            // --- Phase 1: Probe for next candidate range and anchor ---
+            let mut next_candidate_start = u64::MAX;
+
+            println!(" -> Phase 1: Probing columns...");
             for col_name in &self.needed_columns {
-                let iter = self.compressed_chunk_iters.get_mut(col_name)
+                let iter = self
+                    .compressed_chunk_iters
+                    .get_mut(col_name)
                     .ok_or_else(|| ColumnarError::ColumnNotFound(col_name.clone()))?;
-        
-                // Skip chunks entirely before the target offset
-                while let Some(Ok(peeked_chunk)) = iter.peek() {
-                    if peeked_chunk.data.is_empty() {
-                        iter.next(); // Consume empty chunk
-                        continue;
-                    }
-                     // Assume data[0].1 is RichRangeKey (checked later more robustly)
-                    let key = match peeked_chunk.data.get(0) {
-                         Some((_, k, _)) => k.clone(),
-                         None => { // Should not happen if !is_empty checked
-                              iter.next(); // Consume problematic chunk
-                              continue;
-                         }
-                    };
-                    let chunk_range = key.start_offset..(key.start_offset + key.count);
-        
-                    if chunk_range.end <= target_offset {
-                        iter.next(); // Consume chunk before target
-                    } else {
-                        break; // Found chunk potentially covering or after target
+
+                println!("  --> Probing column: {}", col_name);
+
+                // Skip chunks entirely before the target offset OR empty chunks
+                loop {
+                    match iter.peek() {
+                        Some(Ok(peeked_chunk)) => {
+                            // Check if data is empty FIRST
+                            if peeked_chunk.data.is_empty() {
+                                println!(
+                                    "      Skipping empty data chunk (range {:?}) during pre-skip",
+                                    peeked_chunk.range
+                                );
+                                iter.next(); // Consume empty chunk
+                                continue; // Check the next one
+                            }
+
+                            // Now extract key and range (safe because data is not empty)
+                            let key = peeked_chunk.data[0].1.clone(); // Clone key from peek
+                            let chunk_range = key.start_offset..(key.start_offset + key.count);
+
+                            if chunk_range.end <= target_offset {
+                                println!(
+                                    "      Skipping chunk range {:?} (ends before target {})",
+                                    chunk_range, target_offset
+                                );
+                                iter.next(); // Consume chunk before target
+                            } else {
+                                break; // Found chunk potentially covering or after target
+                            }
+                        }
+                        Some(Err(_)) => {
+                            // Error during peek - consume and return
+                            println!("      ERROR: Peeking failed during pre-skip.");
+                            return Err(iter.next().unwrap().err().unwrap());
+                        }
+                        None => {
+                            // Iterator exhausted during pre-skip
+                            println!(
+                                "      Iterator exhausted during pre-skip for column {}",
+                                col_name
+                            );
+                            break; // Stop trying to skip for this column
+                        }
                     }
                 }
-        
+
                 // Check the chunk at or after the target
                 match iter.peek() {
                     Some(Ok(chunk)) => {
-                         if chunk.data.is_empty() { continue; } // Skip if Banyan filtered it
-                         let key = chunk.data[0].1.clone();
-                         let chunk_range = key.start_offset..(key.start_offset + key.count);
-        
-                         // Update the earliest possible start for the *next* valid chunk
-                         next_candidate_start = next_candidate_start.min(chunk_range.start);
-        
-                         if chunk_range.contains(&target_offset) {
-                             if anchor_range.is_none() {
-                                 // This is the first column we found that covers the target
-                                 anchor_range = Some(chunk_range);
-                                 anchor_key = Some(key);
-                             } else {
-                                 // Check consistency with already found anchor
-                                 if Some(&chunk_range) != anchor_range.as_ref() || Some(&key) != anchor_key.as_ref() {
-                                     // Inconsistency detected during probe! We must skip this target.
-                                     // Advance past the *first* range we found.
-                                     advance_target = anchor_range.unwrap().end;
-                                     self.current_absolute_offset = advance_target;
-                                     return Ok(false);
-                                 }
-                             }
-                         }
-                         // else: This chunk starts after target_offset, handled by next_candidate_start
+                        // Check for empty data *again* after skipping
+                        if chunk.data.is_empty() {
+                            println!(
+                                "      Skipping empty data chunk (range {:?}) at/after target",
+                                chunk.range
+                            );
+                            // Do NOT consume here, let the outer loop handle it if needed
+                            continue; // Move to the next column's probe
+                        }
+
+                        let key = chunk.data[0].1.clone(); // Clone key
+                        let chunk_range = key.start_offset..(key.start_offset + key.count);
+                        println!(
+                            "      Found candidate chunk range {:?} with key {:?}",
+                            chunk_range, key
+                        );
+
+                        next_candidate_start = next_candidate_start.min(chunk_range.start);
+                        println!(
+                            "         (next_candidate_start updated to {})",
+                            next_candidate_start
+                        );
+
+                        if chunk_range.contains(&target_offset) {
+                            println!("      -> Chunk covers target_offset {}", target_offset);
+                            if anchor_range.is_none() {
+                                println!(
+                                    "         Setting anchor_range={:?}, anchor_key={:?}",
+                                    chunk_range, key
+                                );
+                                anchor_range = Some(chunk_range);
+                                anchor_key = Some(key);
+                            } else {
+                                if Some(&chunk_range) != anchor_range.as_ref()
+                                    || Some(&key) != anchor_key.as_ref()
+                                {
+                                    let advance_to = anchor_range.as_ref().unwrap().end;
+                                    println!(
+                                         "      ERROR: Inconsistent chunk found during probe! Expected range {:?}/key {:?}, got {:?}/{:?}. Advancing offset to {}.",
+                                         anchor_range, anchor_key, chunk_range, key, advance_to
+                                     );
+                                    self.current_absolute_offset = advance_to;
+                                    let result = Ok(false);
+                                    println!("load_next_chunk returning: {:?} (Inconsistent Probe), new_offset: {}", result, self.current_absolute_offset);
+                                    return result;
+                                } else {
+                                    println!("         Chunk matches existing anchor.");
+                                }
+                            }
+                        } else {
+                            println!(
+                                "      -> Chunk starts after target_offset {}",
+                                target_offset
+                            );
+                        }
                     }
-                    Some(Err(_)) => return Err(iter.next().unwrap().err().unwrap()), // Propagate error
+                    Some(Err(e)) => {
+                        println!("      ERROR: Peeking failed: {}", e);
+                        return Err(iter.next().unwrap().err().unwrap());
+                    }
                     None => {
-                         // This iterator is exhausted before finding the target or a later chunk.
-                         // The overall query might still succeed if other columns cover the range,
-                         // but this specific probe yields no candidate start.
+                        println!(
+                            "      Iterator exhausted for column {} (after skipping)",
+                            col_name
+                        );
                     }
                 }
             } // End Phase 1 Probe Loop
-        
+            println!(" -> Phase 1 Complete.");
+
             // --- Check Probe Results ---
+            println!(
+                " -> Probe Results: anchor_range={:?}, anchor_key={:?}, next_candidate_start={}",
+                anchor_range, anchor_key, next_candidate_start
+            );
             let (expected_range, expected_key) = match (anchor_range, anchor_key) {
-                (Some(r), Some(k)) => (r, k), // Found a candidate chunk covering the target
+                (Some(r), Some(k)) => {
+                    println!(" -> Found anchor covering target offset {}.", target_offset);
+                    (r, k)
+                }
                 _ => {
-                    // No chunk found covering target_offset for *any* column.
-                    // Advance to the next possible start or end of query.
-                    if next_candidate_start > target_offset && next_candidate_start != u64::MAX {
-                        self.current_absolute_offset = next_candidate_start; // Skip gap
+                    let new_offset = if next_candidate_start > target_offset
+                        && next_candidate_start != u64::MAX
+                    {
+                        next_candidate_start
                     } else {
-                        self.current_absolute_offset = self.query_end_offset; // Likely end of all streams
-                    }
-                    return Ok(false);
+                        self.query_end_offset
+                    };
+                    println!(
+                        " -> No anchor found covering target {}. Advancing offset to {}.",
+                        target_offset, new_offset
+                    );
+                    self.current_absolute_offset = new_offset;
+                    let result = Ok(false);
+                    println!(
+                        "load_next_chunk returning: {:?} (No Anchor), new_offset: {}",
+                        result, self.current_absolute_offset
+                    );
+                    return result;
                 }
             };
-        
+
             // --- Phase 2: Verify and Load All Columns ---
+            // (Phase 2 logic remains largely the same, as it relies on the anchor found in Phase 1)
+            println!(
+                " -> Phase 2: Verifying and loading range {:?} with key {:?}",
+                expected_range, expected_key
+            );
             let mut loaded_data = BTreeMap::new();
             for col_name in &self.needed_columns {
-                let iter = self.compressed_chunk_iters.get_mut(col_name).unwrap(); // Known to exist
-        
+                println!("  --> Verifying/Loading column: {}", col_name);
+                let iter = self.compressed_chunk_iters.get_mut(col_name).unwrap();
+
                 match iter.peek() {
                     Some(Ok(chunk)) => {
-                         if chunk.data.is_empty() {
-                             // Inconsistency: Banyan filtered this chunk, but others were not?
-                             eprintln!("Warning: Banyan filtered chunk for column '{}' at expected range {:?}, inconsistent with other columns. Advancing.", col_name, expected_range);
-                             self.current_absolute_offset = expected_range.end;
-                             return Ok(false);
-                         }
-                         let key = chunk.data[0].1.clone();
-                         let chunk_range = key.start_offset..(key.start_offset + key.count);
-        
-                         if chunk_range == expected_range && key == expected_key {
-                             // Consume the verified chunk
-                             let owned_chunk = iter.next().unwrap().unwrap(); // Safe due to peek
-                             let (_, rich_key, col_chunk) = owned_chunk.data.into_iter().next().unwrap();
-        
-                             // Decompress
-                             let decompressed_values = Arc::new(compression::decompress_column(&col_chunk)?);
-                             let expected_len = rich_key.count as usize;
-                             if decompressed_values.len() != expected_len {
-                                  return Err(ColumnarError::InconsistentChunkLength{ expected: expected_len, actual: decompressed_values.len(), column: col_name.clone() }.into());
-                             }
-        
-                             // Extract bitmap
-                              let bitmap = match &col_chunk {
-                                  types::ColumnChunk::Timestamp { present, .. } |
-                                  types::ColumnChunk::Integer { present, .. } |
-                                  types::ColumnChunk::Float { present, .. } |
-                                  types::ColumnChunk::String { present, .. } |
-                                  types::ColumnChunk::Enum { present, .. } => present.bitmap().clone(),
-                              };
-        
-                              // Store for caching
-                              loaded_data.insert(col_name.clone(), DecompressedColumnData {
-                                  bitmap,
-                                  values: decompressed_values,
-                                  chunk_key: rich_key,
-                              });
-        
-                         } else {
-                              // Inconsistency found during verification phase
-                              eprintln!("Warning: Inconsistent chunk found during load for column '{}' at offset {}. Expected {:?}/{:?}, got {:?}/{:?}. Advancing.",
-                                         col_name, target_offset, expected_range, expected_key, chunk_range, key);
-                              self.current_absolute_offset = expected_range.end; // Skip this inconsistent range
-                              return Ok(false);
-                         }
+                        // Check if data is empty FIRST in verification phase too
+                        if chunk.data.is_empty() {
+                            let advance_to = expected_range.end;
+                            println!(
+                                "      ERROR: Empty chunk data found during verification for column '{}' at expected range {:?}. Advancing offset to {}.",
+                                col_name, expected_range, advance_to
+                            );
+                            self.current_absolute_offset = advance_to;
+                            let result = Ok(false);
+                            println!("load_next_chunk returning: {:?} (Empty Chunk Verify), new_offset: {}", result, self.current_absolute_offset);
+                            return result;
+                        }
+
+                        let key = chunk.data[0].1.clone();
+                        let chunk_range = key.start_offset..(key.start_offset + key.count);
+
+                        if chunk_range == expected_range && key == expected_key {
+                            println!("      OK: Chunk matches expected range and key. Consuming.");
+                            let owned_chunk = iter.next().unwrap().unwrap();
+                            let (_, rich_key, col_chunk) = match owned_chunk.data.into_iter().next()
+                            {
+                                Some(data) => data,
+                                None => {
+                                    return Err(ColumnarError::EmptyChunkData {
+                                        column: col_name.clone(),
+                                        offset: target_offset,
+                                    }
+                                    .into())
+                                }
+                            };
+
+                            println!("      Decompressing column data...");
+                            let decompressed_values =
+                                Arc::new(compression::decompress_column(&col_chunk)?);
+                            let expected_len = rich_key.count as usize;
+                            println!(
+                                "      Decompressed {} values (expected {}).",
+                                decompressed_values.len(),
+                                expected_len
+                            );
+
+                            if decompressed_values.len() != expected_len {
+                                return Err(ColumnarError::InconsistentChunkLength {
+                                    expected: expected_len,
+                                    actual: decompressed_values.len(),
+                                    column: col_name.clone(),
+                                }
+                                .into());
+                            }
+
+                            let bitmap = match &col_chunk {
+                                types::ColumnChunk::Timestamp { present, .. }
+                                | types::ColumnChunk::Integer { present, .. }
+                                | types::ColumnChunk::Float { present, .. }
+                                | types::ColumnChunk::String { present, .. }
+                                | types::ColumnChunk::Enum { present, .. } => {
+                                    present.bitmap().clone()
+                                }
+                            };
+                            println!("      Extracted bitmap with cardinality {}.", bitmap.len());
+
+                            loaded_data.insert(
+                                col_name.clone(),
+                                DecompressedColumnData {
+                                    bitmap,
+                                    values: decompressed_values,
+                                    chunk_key: rich_key,
+                                },
+                            );
+                        } else {
+                            let advance_to = expected_range.end;
+                            println!(
+                                "      ERROR: Inconsistent chunk found during verification! Expected {:?}/{:?}, got {:?}/{:?}. Advancing offset to {}.",
+                                expected_range, expected_key, chunk_range, key, advance_to
+                            );
+                            self.current_absolute_offset = advance_to;
+                            let result = Ok(false);
+                            println!("load_next_chunk returning: {:?} (Inconsistent Verify), new_offset: {}", result, self.current_absolute_offset);
+                            return result;
+                        }
                     }
-                    Some(Err(_)) => return Err(iter.next().unwrap().err().unwrap()), // Propagate error
+                    Some(Err(_)) => {
+                        println!("      ERROR: Peeking failed during verification.");
+                        return Err(iter.next().unwrap().err().unwrap());
+                    }
                     None => {
-                          // Iterator ended when we expected data - inconsistency
-                          eprintln!("Warning: Iterator for column '{}' ended unexpectedly when verifying offset {}. Advancing.", col_name, target_offset);
-                          self.current_absolute_offset = expected_range.end; // Skip this inconsistent range
-                          return Ok(false);
+                        let advance_to = expected_range.end;
+                        println!(
+                            "      ERROR: Iterator for column '{}' ended unexpectedly during verification for offset {}. Advancing offset to {}.",
+                            col_name, target_offset, advance_to
+                        );
+                        self.current_absolute_offset = advance_to;
+                        let result = Ok(false);
+                        println!("load_next_chunk returning: {:?} (Unexpected End Verify), new_offset: {}", result, self.current_absolute_offset);
+                        return result;
                     }
                 }
             } // End Phase 2 Loop
-        
+
             // If we reach here, all columns were successfully loaded and verified
             self.current_decompressed_chunk_cache = loaded_data;
-            self.current_chunk_range = expected_range;
-            Ok(true)
+            self.current_chunk_range = expected_range.clone();
+            println!(
+                " -> Phase 2 Complete. Successfully loaded range {:?}",
+                self.current_chunk_range
+            );
+            let result = Ok(true);
+            println!(
+                "load_next_chunk returning: {:?}, new_range: {:?}, new_offset: {}",
+                result, self.current_chunk_range, self.current_absolute_offset
+            );
+            result
         }
     }
 
