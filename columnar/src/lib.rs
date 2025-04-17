@@ -1,29 +1,27 @@
-#![allow(dead_code)] // Allow dead code for this example outline
-#![allow(unused_variables)] // Allow unused variables for this example outline
-#![allow(clippy::type_complexity)] // Allow complex types for iterators/results
-
+/// @testing banyan things
+/// eventually fork and upgrade banyan to latest ipld-core things etc
+/// rust edition too
 use anyhow::{anyhow, Result};
 use banyan::{
-    index::{BranchIndex, CompactSeq, LeafIndex, Summarizable, VecSeq}, // Import LeafIndex/BranchIndex
-    // query::Query as BanyanQueryTrait, // Removed unused import warning
-    store::{BanyanValue, BranchCache, ReadOnlyStore},
+    index::{CompactSeq, Summarizable, VecSeq},
+    store::BranchCache,
     Config, Forest, Secrets, StreamBuilder, Transaction, Tree, TreeTypes,
 };
-use banyan_utils::tags::Sha256Digest; // Or libipld::Cid
+use banyan_utils::tags::Sha256Digest;
 use libipld::{
+    cbor::DagCborCodec,             
+    codec::{Decode, Encode},
+    Cid,
     DagCbor,
-    cbor::DagCborCodec, // Keep DagCbor for derives
-    codec::{Codec, Decode, Encode}, // Import Codec trait
-    // prelude::{Read, Seek, Write},
 };
 use roaring::RoaringBitmap;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-// use serde_bytes::ByteBuf; // Replace ByteBuf
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
 use std::{
     collections::BTreeMap,
     fmt::Debug,
+    io::{Read, Seek, Write},
     marker::PhantomData,
-    ops::{Bound, Range, RangeBounds}, // Import RangeBounds
+    ops::{Bound, Range},
     sync::Arc,
 };
 use thiserror::Error;
@@ -41,17 +39,16 @@ pub enum ColumnarError {
     #[error("Decompression error: {0}")]
     DecompressionError(String),
     #[error("Type error during compression/decompression: expected {expected}, got {actual}")]
-    TypeError {
-        expected: String,
-        actual: String,
-    },
+    TypeError { expected: String, actual: String },
     #[error("Roaring Bitmap error: {0}")]
     RoaringError(#[from] std::io::Error), // Roaring uses std::io::Error
     #[error("Banyan error: {0}")]
     BanyanError(#[from] anyhow::Error), // Wrap generic anyhow errors from Banyan
     #[error("Iterator stopped unexpectedly for column {0}")]
     IteratorStopped(String),
-    #[error("Inconsistent chunk data: expected length {expected}, got {actual} for column {column}")]
+    #[error(
+        "Inconsistent chunk data: expected length {expected}, got {actual} for column {column}"
+    )]
     InconsistentChunkLength {
         expected: usize,
         actual: usize,
@@ -65,6 +62,8 @@ pub enum ColumnarError {
         key_range: Range<u64>,
         column: String,
     },
+    #[error("Deserialize into Cid error: {0}")]
+    DeserializeCidError(#[from] libipld::cid::Error),
 }
 
 // --- Basic Data Types (Potentially shared with user or adapted from row-based lib) ---
@@ -217,7 +216,7 @@ pub mod types {
 
     // Value stored in Banyan leaves (Columnar Data Chunk)
     // Derive DagCbor. Replace ByteBuf with Vec<u8>.
-    #[derive(Clone, Debug, PartialEq, Eq, DagCbor)]
+    #[derive(Clone, Debug, PartialEq, DagCbor)]
     #[ipld(repr = "kinded")]
     pub enum ColumnChunk {
         Timestamp {
@@ -249,7 +248,8 @@ pub mod types {
     }
 
     // BanyanValue requires DagCbor (which implies Encode/Decode for DagCborCodec) + Send + 'static
-    impl BanyanValue for ColumnChunk {}
+    // NVM REDUNDANT
+    // impl BanyanValue for ColumnChunk {}
 
     // Define the TreeTypes implementation
     #[derive(Clone, Debug)]
@@ -326,8 +326,8 @@ pub mod types {
                 summary.max_timestamp_micros = summary
                     .max_timestamp_micros
                     .max(child_summary.max_timestamp_micros);
-                 // start_offset is the minimum start_offset in the sequence
-                 summary.start_offset = summary.start_offset.min(child_summary.start_offset);
+                // start_offset is the minimum start_offset in the sequence
+                summary.start_offset = summary.start_offset.min(child_summary.start_offset);
             }
             summary
         }
@@ -356,10 +356,11 @@ pub mod compression {
         Ok(compressed)
     }
 
-     fn decompress_i64_delta_zstd(data: &[u8]) -> Result<Vec<i64>> {
+    fn decompress_i64_delta_zstd(data: &[u8]) -> Result<Vec<i64>> {
         let cbor_deltas = decode_all(data)?;
         // Use Decode trait method
-        let deltas: Vec<i64> = Decode::decode(DagCborCodec, &mut std::io::Cursor::new(&cbor_deltas))?;
+        let deltas: Vec<i64> =
+            Decode::decode(DagCborCodec, &mut std::io::Cursor::new(&cbor_deltas))?;
         let mut values = Vec::with_capacity(deltas.len());
         let mut current = 0i64;
         for delta in deltas {
@@ -369,45 +370,51 @@ pub mod compression {
         Ok(values)
     }
 
-     fn compress_f64_zstd(values: &[f64]) -> Result<Vec<u8>> {
-        let cbor_data = DagCborCodec.encode(&values)?;
+    fn compress_f64_zstd(values: &[f64]) -> Result<Vec<u8>> {
+        // weird encoding thing. requires .to_vec()
+        // see if acceptable, fork/upgrade deps for banyan necessary at some point anyway
+        let cbor_data = DagCborCodec.encode(&values.to_vec())?;
         let mut compressed = Vec::new();
         copy_encode(&cbor_data[..], &mut compressed, 3)?;
         Ok(compressed)
     }
 
-     fn decompress_f64_zstd(data: &[u8]) -> Result<Vec<f64>> {
+    fn decompress_f64_zstd(data: &[u8]) -> Result<Vec<f64>> {
         let cbor_data = decode_all(data)?;
         let values: Vec<f64> = Decode::decode(DagCborCodec, &mut std::io::Cursor::new(&cbor_data))?;
         Ok(values)
     }
 
-     fn compress_string_zstd(values: &[String]) -> Result<Vec<u8>> {
-         let cbor_data = DagCborCodec.encode(&values)?;
-         let mut compressed = Vec::new();
-         copy_encode(&cbor_data[..], &mut compressed, 3)?;
-         Ok(compressed)
-     }
+    fn compress_string_zstd(values: &[String]) -> Result<Vec<u8>> {
+        // weird encoding thing. requires .to_vec()
+        // see if acceptable, fork/upgrade deps for banyan necessary at some point anyway
+        let cbor_data = DagCborCodec.encode(&values.to_vec())?;
+        let mut compressed = Vec::new();
+        copy_encode(&cbor_data[..], &mut compressed, 3)?;
+        Ok(compressed)
+    }
 
-      fn decompress_string_zstd(data: &[u8]) -> Result<Vec<String>> {
-         let cbor_data = decode_all(data)?;
-         let values: Vec<String> = Decode::decode(DagCborCodec, &mut std::io::Cursor::new(&cbor_data))?;
-         Ok(values)
-     }
+    fn decompress_string_zstd(data: &[u8]) -> Result<Vec<String>> {
+        let cbor_data = decode_all(data)?;
+        let values: Vec<String> =
+            Decode::decode(DagCborCodec, &mut std::io::Cursor::new(&cbor_data))?;
+        Ok(values)
+    }
 
-      fn compress_enum_zstd(values: &[u32]) -> Result<Vec<u8>> {
-         let cbor_data = DagCborCodec.encode(&values)?;
-         let mut compressed = Vec::new();
-         copy_encode(&cbor_data[..], &mut compressed, 3)?;
-         Ok(compressed)
-     }
+    fn compress_enum_zstd(values: &[u32]) -> Result<Vec<u8>> {
+        // weird encoding thing. requires .to_vec()
+        // see if acceptable, fork/upgrade deps for banyan necessary at some point anyway
+        let cbor_data = DagCborCodec.encode(&values.to_vec())?;
+        let mut compressed = Vec::new();
+        copy_encode(&cbor_data[..], &mut compressed, 3)?;
+        Ok(compressed)
+    }
 
-      fn decompress_enum_zstd(data: &[u8]) -> Result<Vec<u32>> {
-         let cbor_data = decode_all(data)?;
-         let values: Vec<u32> = Decode::decode(DagCborCodec, &mut std::io::Cursor::new(&cbor_data))?;
-         Ok(values)
-     }
-
+    fn decompress_enum_zstd(data: &[u8]) -> Result<Vec<u32>> {
+        let cbor_data = decode_all(data)?;
+        let values: Vec<u32> = Decode::decode(DagCborCodec, &mut std::io::Cursor::new(&cbor_data))?;
+        Ok(values)
+    }
 
     pub fn compress_column(
         values: &[Option<Value>],
@@ -431,21 +438,21 @@ pub mod compression {
                     .map(|v| match v {
                         Value::Timestamp(ts) => Ok(ts),
                         _ => Err(ColumnarError::TypeError {
-                                expected: "Timestamp".to_string(),
-                                actual: format!("{:?}", v),
+                            expected: "Timestamp".to_string(),
+                            actual: format!("{:?}", v),
                         }),
                     })
                     .collect::<Result<Vec<i64>, _>>()?; // Collect with specific error type
                 compress_i64_delta_zstd(&dense_i64s)?
             }
             ColumnType::Integer => {
-                 let dense_i64s: Vec<i64> = dense_values
+                let dense_i64s: Vec<i64> = dense_values
                     .into_iter()
                     .map(|v| match v {
                         Value::Integer(i) => Ok(i),
                         _ => Err(ColumnarError::TypeError {
-                                expected: "Integer".to_string(),
-                                actual: format!("{:?}", v),
+                            expected: "Integer".to_string(),
+                            actual: format!("{:?}", v),
                         }),
                     })
                     .collect::<Result<Vec<i64>, _>>()?;
@@ -457,21 +464,21 @@ pub mod compression {
                     .map(|v| match v {
                         Value::Float(f) => Ok(f),
                         _ => Err(ColumnarError::TypeError {
-                                expected: "Float".to_string(),
-                                actual: format!("{:?}", v),
+                            expected: "Float".to_string(),
+                            actual: format!("{:?}", v),
                         }),
                     })
                     .collect::<Result<Vec<f64>, _>>()?;
                 compress_f64_zstd(&dense_f64s)?
             }
-             ColumnType::String => {
+            ColumnType::String => {
                 let dense_strings: Vec<String> = dense_values
                     .into_iter()
                     .map(|v| match v {
                         Value::String(s) => Ok(s),
                         _ => Err(ColumnarError::TypeError {
-                                expected: "String".to_string(),
-                                actual: format!("{:?}", v),
+                            expected: "String".to_string(),
+                            actual: format!("{:?}", v),
                         }),
                     })
                     .collect::<Result<Vec<String>, _>>()?;
@@ -482,9 +489,9 @@ pub mod compression {
                     .into_iter()
                     .map(|v| match v {
                         Value::Enum(idx) => Ok(idx),
-                         _ => Err(ColumnarError::TypeError {
-                                expected: "Enum".to_string(),
-                                actual: format!("{:?}", v),
+                        _ => Err(ColumnarError::TypeError {
+                            expected: "Enum".to_string(),
+                            actual: format!("{:?}", v),
                         }),
                     })
                     .collect::<Result<Vec<u32>, _>>()?;
@@ -492,31 +499,51 @@ pub mod compression {
             }
         };
 
-        Ok((CborRoaringBitmap::from_bitmap(present_bitmap)?, compressed_data))
+        Ok((
+            CborRoaringBitmap::from_bitmap(present_bitmap)?,
+            compressed_data,
+        ))
     }
 
-     pub fn decompress_column(chunk: &types::ColumnChunk) -> Result<Vec<Option<Value>>> {
+    pub fn decompress_column(chunk: &types::ColumnChunk) -> Result<Vec<Option<Value>>> {
         let (present_bitmap, dense_values) = match chunk {
             types::ColumnChunk::Timestamp { present, data } => {
                 let vals = decompress_i64_delta_zstd(data)?;
-                (present.bitmap(), vals.into_iter().map(Value::Timestamp).collect::<Vec<Value>>())
+                (
+                    present.bitmap(),
+                    vals.into_iter()
+                        .map(Value::Timestamp)
+                        .collect::<Vec<Value>>(),
+                )
             }
             types::ColumnChunk::Integer { present, data } => {
-                 let vals = decompress_i64_delta_zstd(data)?;
-                 (present.bitmap(), vals.into_iter().map(Value::Integer).collect::<Vec<Value>>())
+                let vals = decompress_i64_delta_zstd(data)?;
+                (
+                    present.bitmap(),
+                    vals.into_iter().map(Value::Integer).collect::<Vec<Value>>(),
+                )
             }
-             types::ColumnChunk::Float { present, data } => {
-                 let vals = decompress_f64_zstd(data)?;
-                 (present.bitmap(), vals.into_iter().map(Value::Float).collect::<Vec<Value>>())
-             }
-             types::ColumnChunk::String { present, data } => {
-                 let vals = decompress_string_zstd(data)?;
-                 (present.bitmap(), vals.into_iter().map(Value::String).collect::<Vec<Value>>())
-             }
-              types::ColumnChunk::Enum { present, data } => {
-                 let vals = decompress_enum_zstd(data)?;
-                 (present.bitmap(), vals.into_iter().map(Value::Enum).collect::<Vec<Value>>())
-             }
+            types::ColumnChunk::Float { present, data } => {
+                let vals = decompress_f64_zstd(data)?;
+                (
+                    present.bitmap(),
+                    vals.into_iter().map(Value::Float).collect::<Vec<Value>>(),
+                )
+            }
+            types::ColumnChunk::String { present, data } => {
+                let vals = decompress_string_zstd(data)?;
+                (
+                    present.bitmap(),
+                    vals.into_iter().map(Value::String).collect::<Vec<Value>>(),
+                )
+            }
+            types::ColumnChunk::Enum { present, data } => {
+                let vals = decompress_enum_zstd(data)?;
+                (
+                    present.bitmap(),
+                    vals.into_iter().map(Value::Enum).collect::<Vec<Value>>(),
+                )
+            }
         };
 
         let max_index = present_bitmap.max().map(|m| m + 1).unwrap_or(0); // Use max+1 for len
@@ -531,12 +558,14 @@ pub mod compression {
             }
         }
         if dense_iter.next().is_some() {
-            return Err(ColumnarError::DecompressionError("Mismatch between bitmap and decompressed value count".to_string()).into());
+            return Err(ColumnarError::DecompressionError(
+                "Mismatch between bitmap and decompressed value count".to_string(),
+            )
+            .into());
         }
 
         Ok(result)
     }
-
 }
 
 // --- Banyan Query Logic ---
@@ -556,10 +585,7 @@ pub mod query {
     }
 
     // Helper function to check range intersection manually
-    fn ranges_intersect<T: PartialOrd>(
-        r1: (Bound<T>, Bound<T>),
-        r2: (Bound<T>, Bound<T>),
-    ) -> bool {
+    fn ranges_intersect<T: PartialOrd>(r1: (Bound<T>, Bound<T>), r2: (Bound<T>, Bound<T>)) -> bool {
         !range_lt(r1.1, r2.0) && !range_lt(r2.1, r1.0)
     }
 
@@ -575,29 +601,45 @@ pub mod query {
         }
     }
 
-
     impl Query<ColumnarTreeTypes> for ColumnarBanyanQuery {
         fn containing(&self, _offset: u64, index: &LeafIndex<ColumnarTreeTypes>, res: &mut [bool]) {
             let key = &index.keys.first();
-            let key_offset_range = (Bound::Included(key.start_offset), Bound::Excluded(key.start_offset + key.count));
-            let key_time_range = (Bound::Included(key.min_timestamp_micros), Bound::Included(key.max_timestamp_micros));
+            let key_offset_range = (
+                Bound::Included(key.start_offset),
+                Bound::Excluded(key.start_offset + key.count),
+            );
+            let key_time_range = (
+                Bound::Included(key.min_timestamp_micros),
+                Bound::Included(key.max_timestamp_micros),
+            );
 
-            let overlaps = ranges_intersect(self.offset_range, key_offset_range) &&
-                           ranges_intersect(self.time_range_micros, key_time_range);
+            let overlaps = ranges_intersect(self.offset_range, key_offset_range)
+                && ranges_intersect(self.time_range_micros, key_time_range);
 
             for r in res.iter_mut() {
                 *r &= overlaps;
             }
         }
 
-        fn intersecting(&self, _offset: u64, index: &BranchIndex<ColumnarTreeTypes>, res: &mut [bool]) {
+        fn intersecting(
+            &self,
+            _offset: u64,
+            index: &BranchIndex<ColumnarTreeTypes>,
+            res: &mut [bool],
+        ) {
             for (i, summary) in index.summaries.as_ref().iter().enumerate() {
                 if res[i] {
-                    let summary_offset_range = (Bound::Included(summary.start_offset), Bound::Excluded(summary.start_offset + summary.total_count));
-                    let summary_time_range = (Bound::Included(summary.min_timestamp_micros), Bound::Included(summary.max_timestamp_micros));
+                    let summary_offset_range = (
+                        Bound::Included(summary.start_offset),
+                        Bound::Excluded(summary.start_offset + summary.total_count),
+                    );
+                    let summary_time_range = (
+                        Bound::Included(summary.min_timestamp_micros),
+                        Bound::Included(summary.max_timestamp_micros),
+                    );
 
-                     res[i] = ranges_intersect(self.offset_range, summary_offset_range) &&
-                              ranges_intersect(self.time_range_micros, summary_time_range);
+                    res[i] = ranges_intersect(self.offset_range, summary_offset_range)
+                        && ranges_intersect(self.time_range_micros, summary_time_range);
                 }
             }
         }
@@ -635,12 +677,12 @@ pub mod query {
             match row.get(&filter.column_name) {
                 Some(Some(row_value)) => compare_values(row_value, &filter.value, &filter.operator),
                 Some(None) => false, // Filter usually fails if value is NULL, adjust if needed
-                None => false, // Column not present in (partial) row, filter fails
+                None => false,       // Column not present in (partial) row, filter fails
             }
         })
     }
 
-     // Comparison logic (simplified, needs robust type handling)
+    // Comparison logic (simplified, needs robust type handling)
     fn compare_values(left: &Value, right: &Value, op: &Comparison) -> bool {
         match op {
             Comparison::Equals => left == right,
@@ -649,34 +691,34 @@ pub mod query {
                 (Value::Integer(l), Value::Integer(r)) => l > r,
                 (Value::Float(l), Value::Float(r)) => l > r,
                 (Value::Timestamp(l), Value::Timestamp(r)) => l > r,
-                 // Attempt float/int comparison
-                 (Value::Float(l), Value::Integer(r)) => *l > (*r as f64),
-                 (Value::Integer(l), Value::Float(r)) => (*l as f64) > *r,
+                // Attempt float/int comparison
+                (Value::Float(l), Value::Integer(r)) => *l > (*r as f64),
+                (Value::Integer(l), Value::Float(r)) => (*l as f64) > *r,
                 _ => false, // Type mismatch for GT
             },
-             Comparison::GreaterThanOrEqual => match (left, right) {
+            Comparison::GreaterThanOrEqual => match (left, right) {
                 (Value::Integer(l), Value::Integer(r)) => l >= r,
                 (Value::Float(l), Value::Float(r)) => l >= r,
                 (Value::Timestamp(l), Value::Timestamp(r)) => l >= r,
-                 (Value::Float(l), Value::Integer(r)) => *l >= (*r as f64),
-                 (Value::Integer(l), Value::Float(r)) => (*l as f64) >= *r,
-                 _ => false,
+                (Value::Float(l), Value::Integer(r)) => *l >= (*r as f64),
+                (Value::Integer(l), Value::Float(r)) => (*l as f64) >= *r,
+                _ => false,
             },
-             Comparison::LessThan => match (left, right) {
+            Comparison::LessThan => match (left, right) {
                 (Value::Integer(l), Value::Integer(r)) => l < r,
                 (Value::Float(l), Value::Float(r)) => l < r,
                 (Value::Timestamp(l), Value::Timestamp(r)) => l < r,
-                 (Value::Float(l), Value::Integer(r)) => *l < (*r as f64),
-                 (Value::Integer(l), Value::Float(r)) => (*l as f64) < *r,
-                 _ => false,
+                (Value::Float(l), Value::Integer(r)) => *l < (*r as f64),
+                (Value::Integer(l), Value::Float(r)) => (*l as f64) < *r,
+                _ => false,
             },
-             Comparison::LessThanOrEqual => match (left, right) {
+            Comparison::LessThanOrEqual => match (left, right) {
                 (Value::Integer(l), Value::Integer(r)) => l <= r,
                 (Value::Float(l), Value::Float(r)) => l <= r,
                 (Value::Timestamp(l), Value::Timestamp(r)) => l <= r,
-                 (Value::Float(l), Value::Integer(r)) => *l <= (*r as f64),
-                 (Value::Integer(l), Value::Float(r)) => (*l as f64) <= *r,
-                 _ => false,
+                (Value::Float(l), Value::Integer(r)) => *l <= (*r as f64),
+                (Value::Integer(l), Value::Float(r)) => (*l as f64) <= *r,
+                _ => false,
             },
         }
     }
@@ -687,13 +729,12 @@ pub mod manager {
     use super::compression;
     use super::iterator::ColumnarResultIterator;
     use super::query::{ColumnarBanyanQuery, ValueFilter};
-    use super::types::{ColumnarTreeTypes, ColumnChunk, RichRangeKey}; // Use types module
+    use super::types::{ColumnChunk, ColumnarTreeTypes, RichRangeKey}; // Use types module
     use super::*; // Import top-level things like DataDefinition, Record etc.
     use banyan::store::{BlockWriter, ReadOnlyStore}; // Keep these imports specific
     use banyan_utils::tags::Sha256Digest; // Or Cid
     use std::path::Path;
     use std::sync::Arc;
-    use libipld::Cid; // Import Cid if needed for Sha256Digest conversion/serialization
 
     // Define a concrete store type or use a generic BanyanStore trait
     pub trait ColumnarBanyanStore:
@@ -726,10 +767,42 @@ pub mod manager {
     //     }
     // }
 
+    pub struct SerializableCid(pub Cid); // Make inner Cid public
+
+    impl Serialize for SerializableCid {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            // Serialize as a string
+            self.0.to_string().serialize(serializer)
+        }
+    }
+
+
+
+    impl<'de> Deserialize<'de> for SerializableCid {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>, // D is the specific Deserializer being used
+        {
+            let s = String::deserialize(deserializer)?;
+            Cid::try_from(s)
+                .map(SerializableCid)
+                .map_err(|cid_error| {
+                    // Convert the underlying error to a message string
+                    let msg = format!("Failed to parse CID from string: {}", cid_error);
+                    // Use the ::custom associated function from the Error trait,
+                    // which is implemented by D::Error.
+                    D::Error::custom(msg)
+                })
+        }
+    }
     // Simple state persistence (replace with proper serialization/storage)
+    // maybe store this metadata in ipfs as well? not sure here.. hmm.
     #[derive(Serialize, Deserialize)]
     struct ManagerState {
-        column_cids: BTreeMap<String, Option<Sha256Digest>>,
+        column_cids: BTreeMap<String, Option<SerializableCid>>,
         total_rows: u64,
     }
 
@@ -739,7 +812,8 @@ pub mod manager {
         data_definition: Arc<DataDefinition>,
         column_builders: BTreeMap<String, StreamBuilder<ColumnarTreeTypes, ColumnChunk>>,
         column_cids: BTreeMap<String, Option<Sha256Digest>>, // Store CIDs for persistence
-        total_rows: u64,
+        // pub for now for tests, figure out interfaces for this fully w/ persistence methods etc
+        pub total_rows: u64,
         config: Config, // Banyan config
         secrets: Secrets, // Banyan secrets
                         // Potentially add path for persistence state file
@@ -771,18 +845,17 @@ pub mod manager {
                 total_rows: 0,
                 config: config.clone(), // Clone config
                 secrets: secrets.clone(), // Clone secrets
-                // persistence_path: persistence_path.map(|p| p.to_path_buf()),
+                                        // persistence_path: persistence_path.map(|p| p.to_path_buf()),
             };
 
             // Initialize builders and CIDs
             for name in column_names {
-                 manager.column_builders.insert(
-                     name.clone(),
-                     StreamBuilder::new(manager.config.clone(), manager.secrets.clone()),
-                 );
-                 manager.column_cids.insert(name, None);
+                manager.column_builders.insert(
+                    name.clone(),
+                    StreamBuilder::new(manager.config.clone(), manager.secrets.clone()),
+                );
+                manager.column_cids.insert(name, None);
             }
-
 
             // // Attempt to load state if path provided
             // if let Some(path) = &manager.persistence_path {
@@ -805,15 +878,13 @@ pub mod manager {
             let mut txn = Transaction::new(self.forest.clone(), self.store.clone());
             self.column_builders.clear();
             for (name, cid_opt) in &self.column_cids {
-                 let builder = match cid_opt {
-                     Some(cid) => txn.load_stream_builder(
-                         self.secrets.clone(),
-                         self.config.clone(),
-                         *cid,
-                     )?,
-                     None => StreamBuilder::new(self.config.clone(), self.secrets.clone()),
-                 };
-                 self.column_builders.insert(name.clone(), builder);
+                let builder = match cid_opt {
+                    Some(cid) => {
+                        txn.load_stream_builder(self.secrets.clone(), self.config.clone(), *cid)?
+                    }
+                    None => StreamBuilder::new(self.config.clone(), self.secrets.clone()),
+                };
+                self.column_builders.insert(name.clone(), builder);
             }
             Ok(())
         }
@@ -851,8 +922,10 @@ pub mod manager {
                     max_ts = max_ts.max(*ts);
                 }
             }
-            if min_ts == i64::MAX { min_ts = 0; max_ts = 0; }
-
+            if min_ts == i64::MAX {
+                min_ts = 0;
+                max_ts = 0;
+            }
 
             let key = types::RichRangeKey {
                 start_offset,
@@ -872,22 +945,39 @@ pub mod manager {
                     .collect();
 
                 let (bitmap, compressed_data) =
-                     compression::compress_column(&column_values, &col_def.column_type)?;
+                    compression::compress_column(&column_values, &col_def.column_type)?;
 
                 let chunk = match col_def.column_type {
-                    ColumnType::Timestamp => ColumnChunk::Timestamp { present: bitmap, data: compressed_data },
-                    ColumnType::Integer => ColumnChunk::Integer { present: bitmap, data: compressed_data },
-                    ColumnType::Float => ColumnChunk::Float { present: bitmap, data: compressed_data },
-                    ColumnType::String => ColumnChunk::String { present: bitmap, data: compressed_data },
-                    ColumnType::Enum(_) => ColumnChunk::Enum { present: bitmap, data: compressed_data },
+                    ColumnType::Timestamp => ColumnChunk::Timestamp {
+                        present: bitmap,
+                        data: compressed_data,
+                    },
+                    ColumnType::Integer => ColumnChunk::Integer {
+                        present: bitmap,
+                        data: compressed_data,
+                    },
+                    ColumnType::Float => ColumnChunk::Float {
+                        present: bitmap,
+                        data: compressed_data,
+                    },
+                    ColumnType::String => ColumnChunk::String {
+                        present: bitmap,
+                        data: compressed_data,
+                    },
+                    ColumnType::Enum(_) => ColumnChunk::Enum {
+                        present: bitmap,
+                        data: compressed_data,
+                    },
                 };
 
-                let builder = self.column_builders.get_mut(column_name)
+                let builder = self
+                    .column_builders
+                    .get_mut(column_name)
                     .ok_or_else(|| ColumnarError::ColumnNotFound(column_name.clone()))?;
 
                 txn.extend_unpacked(builder, vec![(key.clone(), chunk)])?;
 
-                 self.column_cids.insert(column_name.clone(), builder.link());
+                self.column_cids.insert(column_name.clone(), builder.link());
             }
 
             self.total_rows += count;
@@ -901,7 +991,6 @@ pub mod manager {
             Ok(())
         }
 
-
         pub fn query(
             &self,
             requested_columns: Vec<String>,
@@ -909,18 +998,17 @@ pub mod manager {
             filters: Vec<ValueFilter>, // Value-based filters
             time_range_micros: (Bound<i64>, Bound<i64>), // Time-based filter
         ) -> Result<ColumnarResultIterator<S>> {
-
             let mut needed_columns = requested_columns.clone();
             //let mut filter_columns = Vec::new(); // Keep track separately if needed later
-             // Add columns needed for filtering
+            // Add columns needed for filtering
             for filter in &filters {
                 if !needed_columns.contains(&filter.column_name) {
                     needed_columns.push(filter.column_name.clone());
                 }
-                 // filter_columns.push(filter.column_name.clone());
+                // filter_columns.push(filter.column_name.clone());
             }
-             needed_columns.sort();
-             needed_columns.dedup();
+            needed_columns.sort();
+            needed_columns.dedup();
 
             let banyan_query = ColumnarBanyanQuery {
                 offset_range: offset_range.clone(),
@@ -931,17 +1019,18 @@ pub mod manager {
             let txn = Transaction::new(self.forest.clone(), self.store.clone()); // Read-only transaction
 
             for col_name in &needed_columns {
-                 let cid = self.column_cids.get(col_name)
+                let cid = self
+                    .column_cids
+                    .get(col_name)
                     .ok_or_else(|| ColumnarError::ColumnNotFound(col_name.clone()))?
                     .ok_or_else(|| anyhow!("Column '{}' has no data (CID is None)", col_name))?;
 
-                let tree: Tree<ColumnarTreeTypes, ColumnChunk> = txn.load_tree(self.secrets.clone(), cid)?;
+                let tree: Tree<ColumnarTreeTypes, ColumnChunk> =
+                    txn.load_tree(self.secrets.clone(), cid)?;
 
-                let iter = self.forest.iter_filtered_chunked(
-                    &tree,
-                    banyan_query.clone(),
-                    &|_| (),
-                );
+                let iter = self
+                    .forest
+                    .iter_filtered_chunked(&tree, banyan_query.clone(), &|_| ());
                 column_chunk_iters.insert(col_name.clone(), iter.peekable());
             }
 
@@ -951,11 +1040,10 @@ pub mod manager {
                 Bound::Unbounded => 0,
             };
             let query_end_offset = match offset_range.1 {
-                 Bound::Included(e) => e + 1, // End is exclusive in iterators
-                 Bound::Excluded(e) => e,
-                 Bound::Unbounded => self.total_rows, // Iterate up to the current total rows
+                Bound::Included(e) => e + 1, // End is exclusive in iterators
+                Bound::Excluded(e) => e,
+                Bound::Unbounded => self.total_rows, // Iterate up to the current total rows
             };
-
 
             ColumnarResultIterator::new(
                 self.data_definition.clone(),
@@ -974,12 +1062,11 @@ pub mod manager {
 pub mod iterator {
     use super::compression;
     use super::query::{apply_value_filters, ValueFilter};
-    use super::types::{ColumnChunk, ColumnarTreeTypes, RichRangeKey};
+    use super::types::{ColumnChunk, RichRangeKey};
     use super::*;
     use banyan::FilteredChunk;
     // use std::collections::btree_map::Entry; // Removed unused import warning
     use std::iter::Peekable;
-
 
     // Stores the currently loaded and decompressed chunk for efficient row reconstruction
     #[derive(Debug, Clone)]
@@ -1001,13 +1088,18 @@ pub mod iterator {
         data_definition: Arc<DataDefinition>,
         needed_columns: Vec<String>, // Columns needed for result + filtering
         requested_columns: Vec<String>, // Columns to include in the final output
-        filters: Vec<ValueFilter>,    // Filters to apply after decompression
+        filters: Vec<ValueFilter>,   // Filters to apply after decompression
 
         // Input iterators producing compressed chunks for each needed column
         compressed_chunk_iters: BTreeMap<
             String,
             // Change the type parameter V in FilteredChunk to match Banyan's output
-            Peekable<Box<dyn Iterator<Item = Result<FilteredChunk<(u64, RichRangeKey, ColumnChunk), ()>>> + Send>>,
+            Peekable<
+                Box<
+                    dyn Iterator<Item = Result<FilteredChunk<(u64, RichRangeKey, ColumnChunk), ()>>>
+                        + Send,
+                >,
+            >,
         >,
 
         // State for the current row being processed
@@ -1017,7 +1109,7 @@ pub mod iterator {
         // Cache for the currently loaded and decompressed chunk data for each needed column
         current_decompressed_chunk_cache: BTreeMap<String, DecompressedColumnData>,
         current_chunk_range: Range<u64>, // Range covered by the *currently cached* chunks
-        _store_phantom: PhantomData<S>, // To hold the store type if needed later
+        _store_phantom: PhantomData<S>,  // To hold the store type if needed later
     }
 
     impl<S: manager::ColumnarBanyanStore> ColumnarResultIterator<S> {
@@ -1030,7 +1122,11 @@ pub mod iterator {
             // Change the signature to accept the correct iterator type
             compressed_chunk_iters: BTreeMap<
                 String,
-                Peekable<impl Iterator<Item = Result<FilteredChunk<(u64, RichRangeKey, ColumnChunk), ()>>> + Send + 'static>,
+                Peekable<
+                    impl Iterator<Item = Result<FilteredChunk<(u64, RichRangeKey, ColumnChunk), ()>>>
+                        + Send
+                        + 'static,
+                >,
             >,
             query_start_offset: u64,
             query_end_offset: u64,
@@ -1038,8 +1134,8 @@ pub mod iterator {
             // Box the iterators - remove the incorrect map_data call
             let boxed_iters = compressed_chunk_iters
                 .into_iter()
-                 // The iterator already yields the correct type, just box it.
-                .map(|(k, v)| (k, v.boxed()))
+                // The iterator already yields the correct type, just box it.
+                .map(|(k, v)| (k, v.boxed().peekable()))
                 .collect();
 
             Ok(Self {
@@ -1059,152 +1155,157 @@ pub mod iterator {
         // Load and decompress the next set of aligned chunks covering the target_offset
         fn load_next_chunk(&mut self, target_offset: u64) -> Result<bool> {
             self.current_decompressed_chunk_cache.clear();
-            let mut loaded_chunk_range: Option<Range<u64>> = None;
-            let mut loaded_chunk_key: Option<RichRangeKey> = None; // Store the key too
-            let mut min_next_start_offset = u64::MAX;
-
-
+            let mut anchor_range: Option<Range<u64>> = None;
+            let mut anchor_key: Option<RichRangeKey> = None;
+            let mut next_candidate_start = u64::MAX; // Earliest start >= target_offset
+            let mut advance_target = target_offset; // If we fail, where should we jump to?
+        
+            // --- Phase 1: Probe for next candidate range and anchor ---
             for col_name in &self.needed_columns {
-                let iter = self
-                    .compressed_chunk_iters
-                    .get_mut(col_name)
+                let iter = self.compressed_chunk_iters.get_mut(col_name)
                     .ok_or_else(|| ColumnarError::ColumnNotFound(col_name.clone()))?;
-
-                loop {
-                    match iter.peek() {
-                        Some(Ok(chunk)) => {
-                            // Banyan provides the offset range of the leaf index
-                            let banyan_chunk_range = chunk.range.clone();
-                            min_next_start_offset = min_next_start_offset.min(banyan_chunk_range.start);
-
-                            // Extract the RichRangeKey and ColumnChunk from the data tuple
-                            // If data is empty, it means Banyan filtered this based on the query's
-                            // containing/intersecting logic using the key/summary, but the range
-                            // itself matched. We should skip this chunk.
-                            if chunk.data.is_empty() {
-                                 // Skip this empty chunk and continue the loop
-                                 iter.next(); // Consume the empty chunk
-                                continue;
-                            }
-
-                             // Assume data has exactly one element for our columnar design
-                            if chunk.data.len() != 1 {
-                                return Err(anyhow!("Expected exactly one data element in FilteredChunk for columnar store, found {}", chunk.data.len()));
-                            }
-
-                            let key = chunk.data[0].1.clone(); // This is the RichRangeKey
-                            let chunk_range = key.start_offset..(key.start_offset + key.count);
-
-                             // Verify Banyan range matches key range
-                             if banyan_chunk_range != chunk_range {
-                                 return Err(ColumnarError::InconsistentChunkRange {
-                                     banyan_range: banyan_chunk_range,
-                                     key_range: chunk_range,
-                                     column: col_name.clone(),
-                                 }.into());
-                             }
-
-
-                            if chunk_range.contains(&target_offset) {
-                                if let Some(ref loaded_range) = loaded_chunk_range {
-                                    if chunk_range != *loaded_range {
-                                        self.current_absolute_offset = loaded_range.end;
-                                        eprintln!(
-                                            "Warning: Inconsistent chunk ranges detected at offset {}. Expected {:?}, got {:?} for column {}. Skipping.",
-                                            target_offset, loaded_range, chunk_range, col_name
-                                        );
-                                         self.current_decompressed_chunk_cache.clear();
-                                        return Ok(false);
-                                    }
-                                    // Ensure keys are also consistent
-                                    if Some(&key) != loaded_chunk_key.as_ref() {
-                                        self.current_absolute_offset = loaded_range.end;
-                                         eprintln!(
-                                            "Warning: Inconsistent chunk keys detected at offset {}. Expected {:?}, got {:?} for column {}. Skipping.",
-                                            target_offset, loaded_chunk_key, key, col_name
-                                        );
-                                         self.current_decompressed_chunk_cache.clear();
-                                         return Ok(false);
-                                    }
-                                } else {
-                                    loaded_chunk_range = Some(chunk_range.clone());
-                                    loaded_chunk_key = Some(key.clone());
-                                }
-
-                                let owned_chunk_result = iter.next().unwrap();
-                                let owned_chunk = owned_chunk_result?;
-                                if owned_chunk.data.is_empty() {
-                                      // Should have been caught by the peek check, but double-check
-                                      return Err(ColumnarError::EmptyChunkData{ column: col_name.clone(), offset: target_offset }.into());
-                                }
-
-                                let (_, rich_key, col_chunk) = owned_chunk.data.into_iter().next().unwrap(); // Use into_iter().next()
-
-                                let decompressed_values = Arc::new(compression::decompress_column(&col_chunk)?);
-
-                                let expected_len = rich_key.count as usize;
-                                if decompressed_values.len() != expected_len {
-                                     return Err(ColumnarError::InconsistentChunkLength{
-                                         expected: expected_len,
-                                         actual: decompressed_values.len(),
-                                         column: col_name.clone()
-                                     }.into());
-                                }
-
-                                // Extract bitmap directly from ColumnChunk
-                                let bitmap = match &col_chunk {
-                                     types::ColumnChunk::Timestamp { present, .. } |
-                                     types::ColumnChunk::Integer { present, .. } |
-                                     types::ColumnChunk::Float { present, .. } |
-                                     types::ColumnChunk::String { present, .. } |
-                                     types::ColumnChunk::Enum { present, .. } => present.bitmap().clone(),
-                                };
-
-                                self.current_decompressed_chunk_cache.insert(
-                                    col_name.clone(),
-                                    DecompressedColumnData {
-                                        bitmap,
-                                        values: decompressed_values,
-                                        chunk_key: rich_key, // Store the extracted RichRangeKey
-                                    },
-                                );
-                                break;
-                            } else if chunk_range.start > target_offset {
-                                eprintln!(
-                                    "Warning: Gap detected for column '{}' at offset {}. Target offset is before chunk {:?}.",
-                                    col_name, target_offset, chunk_range
-                                );
-                                 self.current_absolute_offset = chunk_range.start;
-                                 self.current_decompressed_chunk_cache.clear();
-                                 return Ok(false);
-                            } else {
-                                iter.next();
-                            }
-                        }
-                        Some(Err(_)) => {
-                            return Err(iter.next().unwrap().err().unwrap());
-                        }
-                        None => {
-                            return Ok(false);
-                        }
+        
+                // Skip chunks entirely before the target offset
+                while let Some(Ok(peeked_chunk)) = iter.peek() {
+                    if peeked_chunk.data.is_empty() {
+                        iter.next(); // Consume empty chunk
+                        continue;
+                    }
+                     // Assume data[0].1 is RichRangeKey (checked later more robustly)
+                    let key = match peeked_chunk.data.get(0) {
+                         Some((_, k, _)) => k.clone(),
+                         None => { // Should not happen if !is_empty checked
+                              iter.next(); // Consume problematic chunk
+                              continue;
+                         }
+                    };
+                    let chunk_range = key.start_offset..(key.start_offset + key.count);
+        
+                    if chunk_range.end <= target_offset {
+                        iter.next(); // Consume chunk before target
+                    } else {
+                        break; // Found chunk potentially covering or after target
                     }
                 }
-            }
-
-            if let Some(range) = loaded_chunk_range {
-                 if self.current_decompressed_chunk_cache.len() == self.needed_columns.len() {
-                    self.current_chunk_range = range;
-                    Ok(true)
-                } else {
-                    eprintln!("Warning: Failed to load chunks for all needed columns at offset {}.", target_offset);
-                    // If we failed to load all, advance to the next possible start offset found
-                     self.current_absolute_offset = min_next_start_offset;
-                     self.current_decompressed_chunk_cache.clear();
-                    Ok(false)
+        
+                // Check the chunk at or after the target
+                match iter.peek() {
+                    Some(Ok(chunk)) => {
+                         if chunk.data.is_empty() { continue; } // Skip if Banyan filtered it
+                         let key = chunk.data[0].1.clone();
+                         let chunk_range = key.start_offset..(key.start_offset + key.count);
+        
+                         // Update the earliest possible start for the *next* valid chunk
+                         next_candidate_start = next_candidate_start.min(chunk_range.start);
+        
+                         if chunk_range.contains(&target_offset) {
+                             if anchor_range.is_none() {
+                                 // This is the first column we found that covers the target
+                                 anchor_range = Some(chunk_range);
+                                 anchor_key = Some(key);
+                             } else {
+                                 // Check consistency with already found anchor
+                                 if Some(&chunk_range) != anchor_range.as_ref() || Some(&key) != anchor_key.as_ref() {
+                                     // Inconsistency detected during probe! We must skip this target.
+                                     // Advance past the *first* range we found.
+                                     advance_target = anchor_range.unwrap().end;
+                                     self.current_absolute_offset = advance_target;
+                                     return Ok(false);
+                                 }
+                             }
+                         }
+                         // else: This chunk starts after target_offset, handled by next_candidate_start
+                    }
+                    Some(Err(_)) => return Err(iter.next().unwrap().err().unwrap()), // Propagate error
+                    None => {
+                         // This iterator is exhausted before finding the target or a later chunk.
+                         // The overall query might still succeed if other columns cover the range,
+                         // but this specific probe yields no candidate start.
+                    }
                 }
-            } else {
-                 Ok(false)
-            }
+            } // End Phase 1 Probe Loop
+        
+            // --- Check Probe Results ---
+            let (expected_range, expected_key) = match (anchor_range, anchor_key) {
+                (Some(r), Some(k)) => (r, k), // Found a candidate chunk covering the target
+                _ => {
+                    // No chunk found covering target_offset for *any* column.
+                    // Advance to the next possible start or end of query.
+                    if next_candidate_start > target_offset && next_candidate_start != u64::MAX {
+                        self.current_absolute_offset = next_candidate_start; // Skip gap
+                    } else {
+                        self.current_absolute_offset = self.query_end_offset; // Likely end of all streams
+                    }
+                    return Ok(false);
+                }
+            };
+        
+            // --- Phase 2: Verify and Load All Columns ---
+            let mut loaded_data = BTreeMap::new();
+            for col_name in &self.needed_columns {
+                let iter = self.compressed_chunk_iters.get_mut(col_name).unwrap(); // Known to exist
+        
+                match iter.peek() {
+                    Some(Ok(chunk)) => {
+                         if chunk.data.is_empty() {
+                             // Inconsistency: Banyan filtered this chunk, but others were not?
+                             eprintln!("Warning: Banyan filtered chunk for column '{}' at expected range {:?}, inconsistent with other columns. Advancing.", col_name, expected_range);
+                             self.current_absolute_offset = expected_range.end;
+                             return Ok(false);
+                         }
+                         let key = chunk.data[0].1.clone();
+                         let chunk_range = key.start_offset..(key.start_offset + key.count);
+        
+                         if chunk_range == expected_range && key == expected_key {
+                             // Consume the verified chunk
+                             let owned_chunk = iter.next().unwrap().unwrap(); // Safe due to peek
+                             let (_, rich_key, col_chunk) = owned_chunk.data.into_iter().next().unwrap();
+        
+                             // Decompress
+                             let decompressed_values = Arc::new(compression::decompress_column(&col_chunk)?);
+                             let expected_len = rich_key.count as usize;
+                             if decompressed_values.len() != expected_len {
+                                  return Err(ColumnarError::InconsistentChunkLength{ expected: expected_len, actual: decompressed_values.len(), column: col_name.clone() }.into());
+                             }
+        
+                             // Extract bitmap
+                              let bitmap = match &col_chunk {
+                                  types::ColumnChunk::Timestamp { present, .. } |
+                                  types::ColumnChunk::Integer { present, .. } |
+                                  types::ColumnChunk::Float { present, .. } |
+                                  types::ColumnChunk::String { present, .. } |
+                                  types::ColumnChunk::Enum { present, .. } => present.bitmap().clone(),
+                              };
+        
+                              // Store for caching
+                              loaded_data.insert(col_name.clone(), DecompressedColumnData {
+                                  bitmap,
+                                  values: decompressed_values,
+                                  chunk_key: rich_key,
+                              });
+        
+                         } else {
+                              // Inconsistency found during verification phase
+                              eprintln!("Warning: Inconsistent chunk found during load for column '{}' at offset {}. Expected {:?}/{:?}, got {:?}/{:?}. Advancing.",
+                                         col_name, target_offset, expected_range, expected_key, chunk_range, key);
+                              self.current_absolute_offset = expected_range.end; // Skip this inconsistent range
+                              return Ok(false);
+                         }
+                    }
+                    Some(Err(_)) => return Err(iter.next().unwrap().err().unwrap()), // Propagate error
+                    None => {
+                          // Iterator ended when we expected data - inconsistency
+                          eprintln!("Warning: Iterator for column '{}' ended unexpectedly when verifying offset {}. Advancing.", col_name, target_offset);
+                          self.current_absolute_offset = expected_range.end; // Skip this inconsistent range
+                          return Ok(false);
+                    }
+                }
+            } // End Phase 2 Loop
+        
+            // If we reach here, all columns were successfully loaded and verified
+            self.current_decompressed_chunk_cache = loaded_data;
+            self.current_chunk_range = expected_range;
+            Ok(true)
         }
     }
 
@@ -1217,14 +1318,17 @@ pub mod iterator {
                     return None;
                 }
 
-                if !self.current_chunk_range.contains(&self.current_absolute_offset) {
+                if !self
+                    .current_chunk_range
+                    .contains(&self.current_absolute_offset)
+                {
                     match self.load_next_chunk(self.current_absolute_offset) {
                         Ok(true) => {} // Continue loop
                         Ok(false) => {
-                             if self.current_absolute_offset >= self.query_end_offset {
+                            if self.current_absolute_offset >= self.query_end_offset {
                                 return None;
-                             }
-                             continue; // Try loading at the updated offset
+                            }
+                            continue; // Try loading at the updated offset
                         }
                         Err(e) => {
                             self.current_absolute_offset = self.query_end_offset;
@@ -1233,32 +1337,44 @@ pub mod iterator {
                     }
                 }
 
-                let relative_index = (self.current_absolute_offset - self.current_chunk_range.start) as u32;
+                let relative_index =
+                    (self.current_absolute_offset - self.current_chunk_range.start) as u32;
                 let mut current_row_partial_data: BTreeMap<String, Option<Value>> = BTreeMap::new();
                 let mut row_is_present_somewhere = false;
 
                 for col_name in &self.needed_columns {
-                    if let Some(decompressed_data) = self.current_decompressed_chunk_cache.get(col_name) {
+                    if let Some(decompressed_data) =
+                        self.current_decompressed_chunk_cache.get(col_name)
+                    {
                         if decompressed_data.bitmap.contains(relative_index) {
-                             let dense_index = decompressed_data.bitmap.rank(relative_index).saturating_sub(1); // rank is 1-based
-                             if let Some(value_opt) = decompressed_data.values.get(dense_index as usize) {
-                                 current_row_partial_data.insert(col_name.clone(), value_opt.clone());
-                                 if value_opt.is_some() {
-                                     row_is_present_somewhere = true;
-                                 }
-                             } else {
-                                 self.current_absolute_offset = self.query_end_offset;
-                                 return Some(Err(anyhow!(
+                            let dense_index = decompressed_data
+                                .bitmap
+                                .rank(relative_index)
+                                .saturating_sub(1); // rank is 1-based
+                            if let Some(value_opt) =
+                                decompressed_data.values.get(dense_index as usize)
+                            {
+                                current_row_partial_data
+                                    .insert(col_name.clone(), value_opt.clone());
+                                if value_opt.is_some() {
+                                    row_is_present_somewhere = true;
+                                }
+                            } else {
+                                self.current_absolute_offset = self.query_end_offset;
+                                return Some(Err(anyhow!(
                                      "Inconsistency: Bitmap indicates presence but value missing at relative index {} (dense index {}) for column {}",
                                      relative_index, dense_index, col_name
                                  )));
-                             }
+                            }
                         } else {
                             current_row_partial_data.insert(col_name.clone(), None);
                         }
                     } else {
-                         self.current_absolute_offset = self.query_end_offset;
-                         return Some(Err(anyhow!("Decompressed data cache missing for needed column '{}'", col_name)));
+                        self.current_absolute_offset = self.query_end_offset;
+                        return Some(Err(anyhow!(
+                            "Decompressed data cache missing for needed column '{}'",
+                            col_name
+                        )));
                     }
                 }
 
@@ -1266,7 +1382,7 @@ pub mod iterator {
                     false
                 } else {
                     // Use corrected variable name here
-                     apply_value_filters(&current_row_partial_data, &self.filters)
+                    apply_value_filters(&current_row_partial_data, &self.filters)
                 };
 
                 self.current_absolute_offset += 1;
@@ -1311,7 +1427,10 @@ mod tests {
 
     // Helper to create MemStore easily in tests
     fn create_test_mem_store() -> MemStore<Sha256Digest> {
-        MemStore::new(usize::MAX, Sha256Digest::digest)
+        println!("creatin store");
+        let store = MemStore::new(usize::MAX, Sha256Digest::digest);
+        println!("store created");
+        store
     }
 
     fn create_test_manager() -> Result<ColumnarDatastreamManager<MemStore<Sha256Digest>>> {
@@ -1319,11 +1438,26 @@ mod tests {
         let config = Config::debug_fast(); // Use fast config for tests
         let secrets = Secrets::default();
         let data_def = DataDefinition::new(vec![
-            ColumnDefinition { name: "timestamp".to_string(), column_type: ColumnType::Timestamp },
-            ColumnDefinition { name: "device_id".to_string(), column_type: ColumnType::String },
-            ColumnDefinition { name: "temperature".to_string(), column_type: ColumnType::Float },
-            ColumnDefinition { name: "humidity".to_string(), column_type: ColumnType::Float },
-             ColumnDefinition { name: "status".to_string(), column_type: ColumnType::Enum(vec!["OK".into(), "WARN".into(), "ERROR".into()]) },
+            ColumnDefinition {
+                name: "timestamp".to_string(),
+                column_type: ColumnType::Timestamp,
+            },
+            ColumnDefinition {
+                name: "device_id".to_string(),
+                column_type: ColumnType::String,
+            },
+            ColumnDefinition {
+                name: "temperature".to_string(),
+                column_type: ColumnType::Float,
+            },
+            ColumnDefinition {
+                name: "humidity".to_string(),
+                column_type: ColumnType::Float,
+            },
+            ColumnDefinition {
+                name: "status".to_string(),
+                column_type: ColumnType::Enum(vec!["OK".into(), "WARN".into(), "ERROR".into()]),
+            },
         ]);
         ColumnarDatastreamManager::new(store, data_def, config, secrets)
     }
@@ -1333,16 +1467,28 @@ mod tests {
         for i in 0..count {
             let offset = start_offset + i as u64;
             let mut record = Record::new();
-            record.insert("timestamp".to_string(), Some(Value::Timestamp(offset as i64 * 1_000_000))); // Example timestamp in micros
-            record.insert("device_id".to_string(), Some(Value::String(format!("dev_{}", offset % 10))));
-            record.insert("temperature".to_string(), Some(Value::Float(20.0 + (offset % 10) as f64 + (i as f64 * 0.1))));
-             // Introduce some nulls
-             if i % 5 != 0 {
-                record.insert("humidity".to_string(), Some(Value::Float(50.0 - (offset % 5) as f64 - (i as f64 * 0.05))));
-             } else {
-                 record.insert("humidity".to_string(), None);
-             }
-             record.insert("status".to_string(), Some(Value::Enum((offset % 3) as u32)));
+            record.insert(
+                "timestamp".to_string(),
+                Some(Value::Timestamp(offset as i64 * 1_000_000)),
+            ); // Example timestamp in micros
+            record.insert(
+                "device_id".to_string(),
+                Some(Value::String(format!("dev_{}", offset % 10))),
+            );
+            record.insert(
+                "temperature".to_string(),
+                Some(Value::Float(20.0 + (offset % 10) as f64 + (i as f64 * 0.1))),
+            );
+            // Introduce some nulls
+            if i % 5 != 0 {
+                record.insert(
+                    "humidity".to_string(),
+                    Some(Value::Float(50.0 - (offset % 5) as f64 - (i as f64 * 0.05))),
+                );
+            } else {
+                record.insert("humidity".to_string(), None);
+            }
+            record.insert("status".to_string(), Some(Value::Enum((offset % 3) as u32)));
 
             records.push(record);
         }
@@ -1354,11 +1500,12 @@ mod tests {
         let mut manager = create_test_manager()?;
         let records1 = create_test_records(0, 50);
         let records2 = create_test_records(50, 50);
-
+        println!("extending with records1");
         manager.extend(&records1)?;
         assert_eq!(manager.total_rows, 50);
         manager.extend(&records2)?;
         assert_eq!(manager.total_rows, 100);
+        println!("extending with records2");
 
         // Query all data for specific columns
         let results_iter = manager.query(
@@ -1367,21 +1514,34 @@ mod tests {
             vec![], // No value filters
             (Bound::Unbounded, Bound::Unbounded),
         )?;
+        println!("querying all data");
 
         let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
         assert_eq!(results.len(), 100);
         // Check first record's data (relative to creation logic)
-        assert_eq!(results[0].get("timestamp"), Some(&Value::Timestamp(0 * 1_000_000)));
-        assert_eq!(results[0].get("temperature"), Some(&Value::Float(20.0 + (0 % 10) as f64 + (0.0 * 0.1)))); // Fixed calculation
-         // Check last record's data
-        assert_eq!(results[99].get("timestamp"), Some(&Value::Timestamp(99 * 1_000_000)));
+        assert_eq!(
+            results[0].get("timestamp"),
+            Some(&Value::Timestamp(0 * 1_000_000))
+        );
+        assert_eq!(
+            results[0].get("temperature"),
+            Some(&Value::Float(20.0 + (0 % 10) as f64 + (0.0 * 0.1)))
+        ); // Fixed calculation
+           // Check last record's data
+        assert_eq!(
+            results[99].get("timestamp"),
+            Some(&Value::Timestamp(99 * 1_000_000))
+        );
         // Index i for the second batch runs from 0 to 49. For absolute offset 99, i is 49.
-        assert_eq!(results[99].get("temperature"), Some(&Value::Float(20.0 + (99 % 10) as f64 + (49.0 * 0.1)))); // Fixed calculation
+        assert_eq!(
+            results[99].get("temperature"),
+            Some(&Value::Float(20.0 + (99 % 10) as f64 + (49.0 * 0.1)))
+        ); // Fixed calculation
 
         Ok(())
     }
 
-     #[test]
+    #[test]
     fn test_query_with_offset_range() -> Result<()> {
         let mut manager = create_test_manager()?;
         let records = create_test_records(0, 100);
@@ -1396,9 +1556,14 @@ mod tests {
         )?;
         let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
         assert_eq!(results.len(), 10); // 20 - 10
-        assert_eq!(results[0].get("timestamp"), Some(&Value::Timestamp(10 * 1_000_000)));
-        assert_eq!(results[9].get("timestamp"), Some(&Value::Timestamp(19 * 1_000_000)));
-
+        assert_eq!(
+            results[0].get("timestamp"),
+            Some(&Value::Timestamp(10 * 1_000_000))
+        );
+        assert_eq!(
+            results[9].get("timestamp"),
+            Some(&Value::Timestamp(19 * 1_000_000))
+        );
 
         // Query offset range [95, ...)
         let results_iter = manager.query(
@@ -1409,9 +1574,14 @@ mod tests {
         )?;
         let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
         assert_eq!(results.len(), 5); // 100 - 95
-        assert_eq!(results[0].get("timestamp"), Some(&Value::Timestamp(95 * 1_000_000)));
-        assert_eq!(results[4].get("timestamp"), Some(&Value::Timestamp(99 * 1_000_000)));
-
+        assert_eq!(
+            results[0].get("timestamp"),
+            Some(&Value::Timestamp(95 * 1_000_000))
+        );
+        assert_eq!(
+            results[4].get("timestamp"),
+            Some(&Value::Timestamp(99 * 1_000_000))
+        );
 
         Ok(())
     }
@@ -1429,17 +1599,21 @@ mod tests {
             vec!["timestamp".to_string()],
             (Bound::Unbounded, Bound::Unbounded),
             vec![],
-             (Bound::Included(start_time), Bound::Excluded(end_time)),
+            (Bound::Included(start_time), Bound::Excluded(end_time)),
         )?;
         let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
         assert_eq!(results.len(), 10);
-         assert_eq!(results[0].get("timestamp"), Some(&Value::Timestamp(start_time)));
-         assert_eq!(results[9].get("timestamp"), Some(&Value::Timestamp(end_time - 1_000_000))); // last included ts
-
+        assert_eq!(
+            results[0].get("timestamp"),
+            Some(&Value::Timestamp(start_time))
+        );
+        assert_eq!(
+            results[9].get("timestamp"),
+            Some(&Value::Timestamp(end_time - 1_000_000))
+        ); // last included ts
 
         Ok(())
     }
-
 
     #[test]
     fn test_query_with_value_filter() -> Result<()> {
@@ -1448,10 +1622,10 @@ mod tests {
         manager.extend(&records)?;
 
         let filter = ValueFilter {
-             column_name: "temperature".to_string(),
-             operator: query::Comparison::GreaterThan,
-             value: Value::Float(28.0),
-         };
+            column_name: "temperature".to_string(),
+            operator: query::Comparison::GreaterThan,
+            value: Value::Float(28.0),
+        };
 
         let results_iter = manager.query(
             vec!["timestamp".to_string(), "temperature".to_string()],
@@ -1466,24 +1640,24 @@ mod tests {
         let mut expected_count = 0;
         for i in 0..100 {
             let offset = i as u64;
-             let temp = 20.0 + (offset % 10) as f64 + (i as f64 * 0.1); // Use absolute offset 'i' for record index 'i'
-             if temp > 28.0 {
-                 expected_count +=1;
-             }
+            let temp = 20.0 + (offset % 10) as f64 + (i as f64 * 0.1); // Use absolute offset 'i' for record index 'i'
+            if temp > 28.0 {
+                expected_count += 1;
+            }
         }
         assert_eq!(results.len(), expected_count);
 
-         for row in results {
-             match row.get("temperature") {
-                 Some(Value::Float(t)) => assert!(*t > 28.0),
-                 _ => panic!("Temperature column missing or wrong type in result"),
-             }
-         }
+        for row in results {
+            match row.get("temperature") {
+                Some(Value::Float(t)) => assert!(*t > 28.0),
+                _ => panic!("Temperature column missing or wrong type in result"),
+            }
+        }
 
         Ok(())
     }
 
-     #[test]
+    #[test]
     fn test_query_with_null_handling() -> Result<()> {
         let mut manager = create_test_manager()?;
         let records = create_test_records(0, 10); // Create 10 records, humidity is null at i=0, i=5
@@ -1503,24 +1677,24 @@ mod tests {
         assert!(results[0].get("humidity").is_none());
         assert!(results[5].get("humidity").is_none());
 
-         assert!(results[1].get("humidity").is_some());
-         assert!(results[2].get("humidity").is_some());
+        assert!(results[1].get("humidity").is_some());
+        assert!(results[2].get("humidity").is_some());
 
-         let filter = ValueFilter {
-             column_name: "humidity".to_string(),
-             operator: query::Comparison::LessThan,
-             value: Value::Float(100.0), // Should match all non-null values
-         };
-         let results_iter_filtered = manager.query(
+        let filter = ValueFilter {
+            column_name: "humidity".to_string(),
+            operator: query::Comparison::LessThan,
+            value: Value::Float(100.0), // Should match all non-null values
+        };
+        let results_iter_filtered = manager.query(
             vec!["timestamp".to_string()],
             (Bound::Unbounded, Bound::Unbounded),
             vec![filter],
             (Bound::Unbounded, Bound::Unbounded),
         )?;
-        let results_filtered: Vec<BTreeMap<String, Value>> = results_iter_filtered.collect::<Result<_>>()?;
-         assert_eq!(results_filtered.len(), 8); // 10 total - 2 nulls
+        let results_filtered: Vec<BTreeMap<String, Value>> =
+            results_iter_filtered.collect::<Result<_>>()?;
+        assert_eq!(results_filtered.len(), 8); // 10 total - 2 nulls
 
         Ok(())
     }
-
 }
