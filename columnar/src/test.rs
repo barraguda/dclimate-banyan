@@ -112,6 +112,7 @@ fn create_test_records(start_offset: u64, count: usize) -> Vec<Record> {
 
 #[test]
 fn test_extend_and_query_basic() -> Result<()> {
+    // TODO: add null tests now that queries return that too.
     setup_logging();
     let store = create_test_mem_store();
     let mut manager = create_test_manager(store, None)?; // No persistence path
@@ -153,7 +154,7 @@ fn test_extend_and_query_basic() -> Result<()> {
         (Bound::Unbounded, Bound::Unbounded), // Full time range
     )?;
 
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     info!("Query returned {} results.", results.len());
 
     assert_eq!(results.len(), 100, "Should return all 100 rows");
@@ -161,26 +162,26 @@ fn test_extend_and_query_basic() -> Result<()> {
     // Check first record (offset 0, index i=0 in first batch)
     assert_eq!(
         results[0].get("timestamp"),
-        Some(&Value::Timestamp(0 * 1_000_000)), // offset 0
+        Some(&Some(Value::Timestamp(0 * 1_000_000))), // offset 0
         "First record timestamp mismatch"
     );
     assert_eq!(
         results[0].get("temperature"),
         // 20.0 + (0 % 10) + (0 * 0.1) = 20.0
-        Some(&Value::Float(20.0)),
+        Some(&Some(Value::Float(20.0))),
         "First record temperature mismatch"
     );
 
     // Check last record (offset 99, index i=49 in second batch)
     assert_eq!(
         results[99].get("timestamp"),
-        Some(&Value::Timestamp(99 * 1_000_000)), // offset 99
+        Some(&Some(Value::Timestamp(99 * 1_000_000))), // offset 99
         "Last record timestamp mismatch"
     );
     assert_eq!(
         results[99].get("temperature"),
         // 20.0 + (99 % 10) + (49 * 0.1) = 20.0 + 9.0 + 4.9 = 33.9
-        Some(&Value::Float(33.9)), // Correct calculation: 20 + (99%10=9) + (i=49)*0.1 = 20+9+4.9
+        Some(&Some(Value::Float(33.9))), // Correct calculation: 20 + (99%10=9) + (i=49)*0.1 = 20+9+4.9
         "Last record temperature mismatch"
     );
 
@@ -204,17 +205,17 @@ fn test_query_with_offset_range() -> Result<()> {
         vec![],
         (Bound::Unbounded, Bound::Unbounded),
     )?;
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     info!("Query [10, 20) returned {} results.", results.len());
     assert_eq!(results.len(), 10, "Offset range [10, 20) failed");
     assert_eq!(
         results[0].get("timestamp"),
-        Some(&Value::Timestamp(10 * 1_000_000)), // First element is offset 10
+        Some(&Some(Value::Timestamp(10 * 1_000_000))), // First element is offset 10
         "Offset range [10, 20) first element mismatch"
     );
     assert_eq!(
         results[9].get("timestamp"),
-        Some(&Value::Timestamp(19 * 1_000_000)), // Last element is offset 19
+        Some(&Some(Value::Timestamp(19 * 1_000_000))), // Last element is offset 19
         "Offset range [10, 20) last element mismatch"
     );
 
@@ -226,17 +227,17 @@ fn test_query_with_offset_range() -> Result<()> {
         vec![],
         (Bound::Unbounded, Bound::Unbounded),
     )?;
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     info!("Query [95, ...) returned {} results.", results.len());
     assert_eq!(results.len(), 5, "Offset range [95, ...) failed"); // 100 - 95 = 5 rows
     assert_eq!(
         results[0].get("timestamp"),
-        Some(&Value::Timestamp(95 * 1_000_000)),
+        Some(&Some(Value::Timestamp(95 * 1_000_000))),
         "Offset range [95, ...) first element mismatch"
     );
     assert_eq!(
         results[4].get("timestamp"),
-        Some(&Value::Timestamp(99 * 1_000_000)),
+        Some(&Some(Value::Timestamp(99 * 1_000_000))),
         "Offset range [95, ...) last element mismatch"
     );
 
@@ -263,19 +264,19 @@ fn test_query_with_time_range() -> Result<()> {
         vec![],
         (Bound::Included(start_time), Bound::Excluded(end_time)), // Time filter
     )?;
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     info!("Time range query returned {} results.", results.len());
 
     // Should include rows with timestamps 30M, 31M, ..., 39M (10 rows)
     assert_eq!(results.len(), 10, "Time range query count mismatch");
     assert_eq!(
         results[0].get("timestamp"),
-        Some(&Value::Timestamp(start_time)), // First timestamp is 30M
+        Some(&Some(Value::Timestamp(start_time))), // First timestamp is 30M
         "Time range first element mismatch"
     );
     assert_eq!(
         results[9].get("timestamp"),
-        Some(&Value::Timestamp(39 * 1_000_000)), // Last timestamp is 39M
+        Some(&Some(Value::Timestamp(39 * 1_000_000))), // Last timestamp is 39M
         "Time range last element mismatch"
     );
 
@@ -306,7 +307,7 @@ fn test_query_with_value_filter() -> Result<()> {
         (Bound::Unbounded, Bound::Unbounded),
     )?;
 
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     info!("Value filter query returned {} results.", results.len());
 
     // Manually calculate expected count and verify results
@@ -328,18 +329,18 @@ fn test_query_with_value_filter() -> Result<()> {
             // Check timestamp matches offset i
             assert_eq!(
                 result_row.get("timestamp"),
-                Some(&Value::Timestamp(offset as i64 * 1_000_000))
+                Some(&Some(Value::Timestamp(offset as i64 * 1_000_000)))
             );
             // Check temperature matches calculation and is > 28.0
             match result_row.get("temperature") {
-                Some(Value::Float(t)) => {
+                Some(&Some(Value::Float(t))) => {
                     // Use approximate comparison for floats
                     assert!(
-                        (*t - temp).abs() < f64::EPSILON,
+                        (t - temp).abs() < f64::EPSILON,
                         "Temperature mismatch for offset {}",
                         offset
                     );
-                    assert!(*t > 28.0, "Filter failed for offset {}", offset);
+                    assert!(t > 28.0, "Filter failed for offset {}", offset);
                 }
                 _ => panic!(
                     "Temperature column missing or wrong type in result for offset {}",
@@ -373,7 +374,7 @@ fn test_query_with_null_handling() -> Result<()> {
         (Bound::Unbounded, Bound::Unbounded),
     )?;
 
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     info!("Query returned {} results.", results.len());
     assert_eq!(
         results.len(),
@@ -382,34 +383,36 @@ fn test_query_with_null_handling() -> Result<()> {
     );
 
     // Check presence/absence of humidity based on creation logic
-    // Remember: the result map ONLY contains non-null values.
-    assert!(
-        results[0].get("humidity").is_none(),
-        "Humidity should be NULL (absent) at offset 0"
+    // Now we expect Some(None) for NULL values
+    assert_eq!(
+        results[0].get("humidity"),
+        Some(&None),
+        "Humidity should be NULL (Some(None)) at offset 0"
     ); // i=0
     assert!(
-        results[1].get("humidity").is_some(),
-        "Humidity should be non-null (present) at offset 1"
+        matches!(results[1].get("humidity"), Some(&Some(Value::Float(_)))),
+        "Humidity should be non-null (Some(Some(Value::Float))) at offset 1"
     ); // i=1
     assert!(
-        results[2].get("humidity").is_some(),
-        "Humidity should be non-null (present) at offset 2"
+        matches!(results[2].get("humidity"), Some(&Some(Value::Float(_)))),
+        "Humidity should be non-null (Some(Some(Value::Float))) at offset 2"
     ); // i=2
     assert!(
-        results[3].get("humidity").is_some(),
-        "Humidity should be non-null (present) at offset 3"
+        matches!(results[3].get("humidity"), Some(&Some(Value::Float(_)))),
+        "Humidity should be non-null (Some(Some(Value::Float))) at offset 3"
     ); // i=3
     assert!(
-        results[4].get("humidity").is_some(),
-        "Humidity should be non-null (present) at offset 4"
+        matches!(results[4].get("humidity"), Some(&Some(Value::Float(_)))),
+        "Humidity should be non-null (Some(Some(Value::Float))) at offset 4"
     ); // i=4
-    assert!(
-        results[5].get("humidity").is_none(),
-        "Humidity should be NULL (absent) at offset 5"
+    assert_eq!(
+        results[5].get("humidity"),
+        Some(&None),
+        "Humidity should be NULL (Some(None)) at offset 5"
     ); // i=5
     assert!(
-        results[6].get("humidity").is_some(),
-        "Humidity should be non-null (present) at offset 6"
+        matches!(results[6].get("humidity"), Some(&Some(Value::Float(_)))),
+        "Humidity should be non-null (Some(Some(Value::Float))) at offset 6"
     ); // i=6
 
     // Now query with a filter that applies to humidity
@@ -425,7 +428,7 @@ fn test_query_with_null_handling() -> Result<()> {
         vec![filter], // Apply the humidity filter
         (Bound::Unbounded, Bound::Unbounded),
     )?;
-    let results_filtered: Vec<BTreeMap<String, Value>> =
+    let results_filtered: Vec<BTreeMap<String, Option<Value>>> =
         results_iter_filtered.collect::<Result<_>>()?;
 
     info!(
@@ -447,7 +450,7 @@ fn test_query_with_null_handling() -> Result<()> {
     let actual_timestamps: Vec<i64> = results_filtered
         .iter()
         .map(|row| match row.get("timestamp") {
-            Some(Value::Timestamp(ts)) => *ts,
+            Some(&Some(Value::Timestamp(ts))) => ts,
             _ => panic!("Timestamp missing in filtered result"),
         })
         .collect();
@@ -538,7 +541,7 @@ fn test_persistence_save_load() -> Result<()> {
         vec![],
         (Bound::Unbounded, Bound::Unbounded),
     )?;
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     info!(
         "Query on loaded manager returned {} results.",
         results.len()
@@ -546,11 +549,11 @@ fn test_persistence_save_load() -> Result<()> {
     assert_eq!(results.len(), 5, "Query after load failed"); // 25 - 20 = 5
     assert_eq!(
         results[0].get("timestamp"),
-        Some(&Value::Timestamp(20 * 1_000_000))
+        Some(&Some(Value::Timestamp(20 * 1_000_000)))
     );
     assert_eq!(
         results[4].get("timestamp"),
-        Some(&Value::Timestamp(24 * 1_000_000))
+        Some(&Some(Value::Timestamp(24 * 1_000_000)))
     );
 
     info!("Extending loaded manager2...");
@@ -568,7 +571,7 @@ fn test_persistence_save_load() -> Result<()> {
         vec![],
         (Bound::Unbounded, Bound::Unbounded),
     )?;
-    let results: Vec<BTreeMap<String, Value>> = results_iter.collect::<Result<_>>()?;
+    let results: Vec<BTreeMap<String, Option<Value>>> = results_iter.collect::<Result<_>>()?;
     assert_eq!(
         results.len(),
         40,
@@ -576,7 +579,7 @@ fn test_persistence_save_load() -> Result<()> {
     );
     assert_eq!(
         results[39].get("timestamp"),
-        Some(&Value::Timestamp(39 * 1_000_000))
+        Some(&Some(Value::Timestamp(39 * 1_000_000)))
     );
 
     info!("Saving extended manager2 state...");

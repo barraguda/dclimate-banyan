@@ -435,7 +435,7 @@ impl<S: ColumnarBanyanStore> ColumnarResultIterator<S> {
 }
 
 impl<S: ColumnarBanyanStore> Iterator for ColumnarResultIterator<S> {
-    type Item = Result<BTreeMap<String, Value>>; // Yield rows as map of column name -> non-null Value
+    type Item = Result<BTreeMap<String, Option<Value>>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -576,19 +576,24 @@ impl<S: ColumnarBanyanStore> Iterator for ColumnarResultIterator<S> {
             self.current_absolute_offset += 1;
 
             if final_filters_pass {
-                let result_row: BTreeMap<String, Value> = self
+                // Yield requested columns including None values
+                let result_row: BTreeMap<String, Option<Value>> = self
                     .requested_columns
                     .iter()
-                    .filter_map(|req_col_name| {
-                        current_row_partial_data
-                            .get(req_col_name)
-                            .and_then(|value_opt| {
-                                value_opt.clone().map(|v| (req_col_name.clone(), v))
-                            })
+                    .map(|req_col_name| {
+                        // Look up the Option<Value> in the map containing all needed columns' data.
+                        // Clone it directly. If the column wasn't present (it should be), default to None.
+                        let value_option = current_row_partial_data
+                            .get(req_col_name) // Option<&Option<Value>>
+                            .map(|option_ref| option_ref.clone()) // Option<Option<Value>>
+                            .unwrap_or(None); // Option<Value> (Handles case where column *wasn't* in partial_data)
+
+                        (req_col_name.clone(), value_option)
                     })
-                    .collect();
-                trace!("    Yielding row: {:?}", result_row);
-                return Some(Ok(result_row));
+                    .collect(); // Collects (String, Option<Value>) tuples
+
+                trace!("    Yielding row (with nulls): {:?}", result_row);
+                return Some(Ok(result_row)); // Yield the map with Option<Value>
             } else {
                 trace!("    Row failed final filters (value: {}, time: {}). Continuing to next offset.", value_filters_pass, time_filter_pass);
                 continue;

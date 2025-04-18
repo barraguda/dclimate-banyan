@@ -110,6 +110,20 @@ pub mod querying {
     // Potentially add Query structure or QueryBuilder here if they exist.
 }
 
+/// IPFS
+use banyan::store::BlockWriter;
+pub use banyan_utils::ipfs::IpfsStore;
+
+pub type MemStore = banyan::store::MemStore<Sha256Digest>;
+
+pub fn memory_store(max_size: usize) -> MemStore {
+    MemStore::new(max_size, Sha256Digest::digest)
+}
+
+pub fn ipfs_available() -> bool {
+    IpfsStore.put(vec![]).is_ok()
+}
+
 /// Exports related to data structures, schema, and types used by the library.
 pub mod data {
     pub use crate::types::{
