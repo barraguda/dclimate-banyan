@@ -275,7 +275,7 @@ impl<S: ColumnarBanyanStore> ColumnarDatastreamManager<S> {
     /// Appends new records to the columnar datastream.
     pub fn extend(&mut self, records: &[Record]) -> Result<()> {
         if records.is_empty() {
-            debug!("Extend called with empty records, doing nothing.");
+            info!("Extend called with 0 records. No changes made.");
             return Ok(());
         }
 
@@ -307,7 +307,7 @@ impl<S: ColumnarBanyanStore> ColumnarDatastreamManager<S> {
             min_timestamp_micros: min_ts,
             max_timestamp_micros: max_ts,
         };
-        debug!("Created key for batch: {:?}", key);
+        debug!(key = ?key, "Created RichRangeKey for batch");
 
         // --- Banyan Transaction ---
         // Create a transaction context holding the store for reading and writing.
@@ -317,7 +317,7 @@ impl<S: ColumnarBanyanStore> ColumnarDatastreamManager<S> {
 
         for col_def in &self.data_definition.columns {
             let column_name = &col_def.name;
-            trace!("Processing column: {}", column_name);
+            trace!(column = %column_name, "Processing column for extend");
 
             // --- Prepare Column Chunk --- (Same as before)
             let column_values: Vec<Option<Value>> = records
@@ -413,9 +413,9 @@ impl<S: ColumnarBanyanStore> ColumnarDatastreamManager<S> {
             // *After* extend_unpacked, the builder reflects the new state. Get its link (CID).
             let new_cid = builder.link();
             trace!(
-                "  New CID for column '{}' after extend: {:?}",
-                column_name,
-                new_cid
+                column = %column_name,
+                new_cid = ?new_cid,
+                "Obtained new CID after extend_unpacked"
             );
             // Store this new CID temporarily. We update the main manager state *after* the transaction scope.
             latest_cids_this_batch.insert(column_name.clone(), new_cid);
@@ -512,40 +512,44 @@ impl<S: ColumnarBanyanStore> ColumnarDatastreamManager<S> {
         }
         needed_columns.sort();
         needed_columns.dedup();
-        debug!("Query needs columns: {:?}", needed_columns);
+        debug!(columns = ?needed_columns, "Query needs columns (requested + filter cols)");
 
         let banyan_query = super::query::ColumnarBanyanQuery {
             // Qualify
             offset_range: offset_range.clone(),
             time_range_micros: time_range_micros.clone(), // Clone time range for banyan query
         };
+        debug!(query = ?banyan_query, "Created Banyan Query");
 
         let mut column_chunk_iters = BTreeMap::new();
         let txn = Transaction::new(self.forest.clone(), self.store.clone());
 
         for col_name in &needed_columns {
             trace!("Setting up iterator for column: {}", col_name);
-            let cid = self.column_cids
-                   .get(col_name)
-                   .ok_or_else(|| {
-                       error!("Internal state error: CID mapping missing for column defined in schema: {}", col_name);
-                        ColumnarError::ColumnNotFound(col_name.clone()) // Qualify
-                   })?
-                   .ok_or_else(|| {
-                       warn!("Query involves column '{}' which has no data yet (CID is None).", col_name);
-                        ColumnarError::ColumnNotInitialized(col_name.clone()) // Qualify
-                   })?;
+            let cid = self.column_cids.get(col_name).cloned().flatten();
+            debug!(column = %col_name, cid = ?cid, "Loading CID for column query");
 
-            trace!("  Loading tree for CID: {}", cid);
-            // Qualify types::* and ColumnChunk
-            let tree: Tree<super::types::ColumnarTreeTypes, super::types::ColumnChunk> =
-                txn.load_tree(self.secrets.clone(), cid)?;
+            match cid {
+                Some(cid) => {
+                    trace!("  Loading tree for CID: {}", cid);
+                    // Qualify types::* and ColumnChunk
+                    let tree: Tree<super::types::ColumnarTreeTypes, super::types::ColumnChunk> =
+                        txn.load_tree(self.secrets.clone(), cid)?;
 
-            let iter = self
-                .forest
-                .iter_filtered_chunked(&tree, banyan_query.clone(), &|_| ());
+                    let iter =
+                        self.forest
+                            .iter_filtered_chunked(&tree, banyan_query.clone(), &|_| ());
 
-            column_chunk_iters.insert(col_name.clone(), iter.peekable());
+                    column_chunk_iters.insert(col_name.clone(), iter.peekable());
+                }
+                None => {
+                    warn!(
+                        "Query involves column '{}' which has no data yet (CID is None).",
+                        col_name
+                    );
+                    return Err(ColumnarError::ColumnNotInitialized(col_name.clone()).into());
+                }
+            }
         }
 
         // Determine the absolute start and end offsets for the Row Iterator

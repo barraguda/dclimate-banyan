@@ -6,7 +6,7 @@ use banyan::index::CompactSeq;
 use banyan::index::{BranchIndex, LeafIndex};
 use banyan::query::Query;
 use std::{collections::BTreeMap, fmt::Debug, ops::Bound};
-use tracing::{error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Banyan Query struct - only contains offset and time ranges for Banyan tree traversal
 #[derive(Debug, Clone)]
@@ -83,10 +83,10 @@ impl Query<ColumnarTreeTypes> for ColumnarBanyanQuery {
         let key_time_end = Bound::Included(key.max_timestamp_micros);
 
         trace!(
-            "Query::containing - Key: {:?}, Query Offset: {:?}, Query Time: {:?}",
-            key,
-            self.offset_range,
-            self.time_range_micros
+            key = ?key,
+            query_offset = ?self.offset_range,
+            query_time = ?self.time_range_micros,
+            "Query::containing check"
         );
 
         let offset_intersects = ranges_intersect(
@@ -104,7 +104,9 @@ impl Query<ColumnarTreeTypes> for ColumnarBanyanQuery {
 
         if offset_intersects && time_intersects {
             trace!(
-                "  -> Key intersects query. Maintaining res state (len {}).",
+                "  -> Intersects (Offset: {}, Time: {}). Maintaining res state (len {}).",
+                offset_intersects,
+                time_intersects,
                 res.len()
             );
             // If the key intersects, we don't need to change `res`. Elements marked true
@@ -138,6 +140,14 @@ impl Query<ColumnarTreeTypes> for ColumnarBanyanQuery {
                 let summary_time_start = Bound::Included(summary.min_timestamp_micros);
                 let summary_time_end = Bound::Included(summary.max_timestamp_micros); // Inclusive
 
+                trace!(
+                    child_idx = i,
+                    summary = ?summary,
+                    query_offset = ?self.offset_range,
+                    query_time = ?self.time_range_micros,
+                    "Query::intersecting check"
+                );
+
                 // Check for intersection
                 let offset_intersects = ranges_intersect(
                     summary_offset_start,
@@ -156,15 +166,19 @@ impl Query<ColumnarTreeTypes> for ColumnarBanyanQuery {
                 if !(offset_intersects && time_intersects) {
                     res[i] = false;
                     trace!(
-                        "Query::intersecting - Pruning child {} with summary {:?}",
-                        i,
-                        summary
+                        child_idx = i,
+                        summary = ?summary,
+                        offset_intersects,
+                        time_intersects,
+                        "  -> Pruning child"
                     );
                 } else {
                     trace!(
-                        "Query::intersecting - Keeping child {} with summary {:?}",
-                        i,
-                        summary
+                        child_idx = i,
+                        summary = ?summary,
+                        offset_intersects,
+                        time_intersects,
+                        "  -> Keeping child"
                     );
                 }
             }
@@ -200,25 +214,32 @@ pub fn apply_value_filters(row: &BTreeMap<String, Option<Value>>, filters: &[Val
     filters.iter().all(|filter| {
         match row.get(&filter.column_name) {
             Some(Some(row_value)) => {
+                trace!(filter = ?filter, value = ?row_value, "Applying filter");
                 // Value exists and is not None, perform comparison
-                compare_values(row_value, &filter.value, &filter.operator)
+                let result = compare_values(row_value, &filter.value, &filter.operator);
+                trace!(result = result, " -> Filter result");
+                result
             }
             Some(None) => {
                 // Value exists but is None (NULL)
+                trace!(filter = ?filter, "Applying filter to NULL value");
                 // How filters handle NULL is important. Often, comparisons with NULL yield false.
                 // Exception: IS NULL / IS NOT NULL filters (if added).
                 // Current behavior: NULL comparison fails unless it's `NotEquals NULL`? Let's make it always false for now.
                 // Or maybe Equals with Null? Let's define: comparison ops always false with NULL.
+                trace!(" -> Filter result: false (NULL value)");
                 false // Filter fails if row value is NULL for standard comparisons
             }
             None => {
                 // Column not present in the (potentially partial) row map.
+                trace!(filter = ?filter, "Applying filter to missing column");
                 // This can happen if the column wasn't requested or during processing.
                 // Treat as filter failure.
                 error!(
                     "Column '{}' required by filter not found in row data: {:?}",
                     filter.column_name, row
                 );
+                trace!(" -> Filter result: false (missing column)");
                 false
             }
         }
