@@ -1,603 +1,559 @@
-// --- Result Iterator ---
-use anyhow::{anyhow, Result};
-use banyan::{index::CompactSeq, FilteredChunk};
-use roaring::RoaringBitmap;
+//! Result iterator that yields rows matching query criteria.
+//!
+//! This iterator consumes chunks from the Banyan query, decompresses relevant
+//! columns, reconstructs rows, and applies final filtering based on offset,
+//! time, and user-defined value predicates.
+
+use crate::{
+    compression,
+    error::{BanyanRowSeqError, Result}, // Use local Result alias
+    query,
+    types::{ChunkKey, DataDefinition, Record, RowSeqData, UserFilter, Value},
+    BanyanRowSeqStore,
+};
+use banyan::FilteredChunk;
 use std::{
-    collections::BTreeMap,
-    fmt::Debug,
-    iter::Peekable,
+    collections::{HashMap, VecDeque},
     marker::PhantomData,
-    ops::{Bound, Range},
+    ops::Bound,
     sync::Arc,
 };
 use tracing::{debug, error, trace, warn};
 
-use crate::{
-    data::ColumnChunk,
-    query::apply_value_filters,
-    store::ColumnarBanyanStore,
-    types::{ColumnarError, DataDefinition, Value},
-};
-
-use crate::compression;
-use crate::query::ValueFilter;
-use crate::types::RichRangeKey;
-
-// Stores the currently loaded and decompressed chunk data for one column
-#[derive(Debug, Clone)]
-struct DecompressedColumnData {
-    bitmap: RoaringBitmap,           // Use RoaringBitmap directly
-    values: Arc<Vec<Option<Value>>>, // Arc avoids cloning Vec for every row
-    chunk_key: RichRangeKey,         // Keep key for range info
+/// Caches decompressed columns for the currently processed chunk.
+/// Uses `Arc` to potentially share decompressed data if needed elsewhere,
+/// though currently primarily used for efficient access within the iterator.
+struct DecompressedChunkCache {
+    /// Map from column name to its decompressed `Vec<Option<Value>>`.
+    columns: HashMap<String, Arc<Vec<Option<Value>>>>,
+    /// The absolute start offset of the cached chunk.
+    _start_offset: u64, // Keep for context if needed, currently unused directly
+    /// The number of rows in the cached chunk.
+    num_rows: u32,
 }
 
-// Helper trait to box iterators generically
-trait BoxedIteratorExt: Iterator + Sized + Send + 'static {
-    fn boxed(self) -> Box<dyn Iterator<Item = Self::Item> + Send> {
-        Box::new(self)
-    }
-}
-impl<I: Iterator + Sized + Send + 'static> BoxedIteratorExt for I {}
-
-/// helper function to check if a value is within a specified range.
-fn bound_contains<T: PartialOrd>(range: &(Bound<T>, Bound<T>), value: &T) -> bool {
-    let (start, end) = range;
-    let after_start = match start {
-        Bound::Included(s) => value >= s,
-        Bound::Excluded(s) => value > s,
-        Bound::Unbounded => true,
-    };
-    let before_end = match end {
-        Bound::Included(e) => value <= e,
-        Bound::Excluded(e) => value < e,
-        Bound::Unbounded => true,
-    };
-    after_start && before_end
-}
-
-/// Iterator that yields rows by fetching, decompressing, and aligning chunks
-/// from multiple column Banyan trees.
-pub struct ColumnarResultIterator<S: ColumnarBanyanStore> {
-    data_definition: Arc<DataDefinition>,
-    needed_columns: Vec<String>, // Columns needed for result + filtering
-    requested_columns: Vec<String>, // Columns to include in the final output map
-    filters: Vec<ValueFilter>,   // Value filters applied after row reconstruction
-    query_time_range_micros: (Bound<i64>, Bound<i64>), // Time range for Banyan pruning
-    // Input iterators producing compressed chunks for each needed column
-    // Banyan's iter_filtered_chunked yields Result<FilteredChunk<(u64, K, V), MappedData = ()>>
-    compressed_chunk_iters: BTreeMap<
-        String,
-        Peekable<
-            Box<
-                dyn Iterator<Item = Result<FilteredChunk<(u64, RichRangeKey, ColumnChunk), ()>>>
-                    + Send,
-            >,
-        >,
+/// An iterator that yields `Record`s matching the query criteria.
+///
+/// It processes `RowSeqData` chunks obtained from a Banyan query,
+/// decompresses necessary columns, reconstructs rows one by one,
+/// and applies offset, time, and value filters before yielding.
+pub struct RowSeqResultIterator<S: BanyanRowSeqStore> {
+    /// Shared reference to the data schema.
+    schema: Arc<DataDefinition>,
+    /// Iterator over filtered chunks provided by the Banyan query engine.
+    /// Boxed to handle the dynamic dispatch of the underlying iterator type.
+    banyan_iter: Box<
+        dyn Iterator<Item = anyhow::Result<FilteredChunk<(u64, ChunkKey, RowSeqData), ()>>> + Send,
     >,
+    /// List of column names requested by the user to include in the result records.
+    requested_columns: Vec<String>,
+    /// List of user-defined filters to apply to reconstructed rows.
+    filters: Vec<UserFilter>,
+    /// The absolute start offset (inclusive) for the query range.
+    query_start_offset: u64,
+    /// The absolute end offset (exclusive) for the query range.
+    query_end_offset_exclusive: u64,
+    /// The timestamp range (inclusive bounds) for the query.
+    query_time_range_micros: (Bound<i64>, Bound<i64>),
 
-    // State for the current row being processed
-    current_absolute_offset: u64, // The next row offset to yield
-    query_end_offset: u64,        // The exclusive end offset for the query
-
-    // Cache for the currently loaded and decompressed chunk data for each needed column
-    // Keyed by column name.
-    current_decompressed_chunk_cache: BTreeMap<String, DecompressedColumnData>,
-    // Range covered by the *currently cached* and aligned chunks
-    current_chunk_range: Range<u64>,
-    _store_phantom: PhantomData<S>, // Keep track of store type if needed
+    // --- Iterator State ---
+    /// Cache for the decompressed columns of the *currently* processed chunk.
+    current_chunk_cache: Option<DecompressedChunkCache>,
+    /// The key of the *currently* processed chunk.
+    current_chunk_key: Option<ChunkKey>,
+    /// The absolute offset of the *next* row this iterator expects to yield.
+    /// Used for offset filtering and tracking progress.
+    next_absolute_offset: u64,
+    /// Internal buffer holding reconstructed rows that passed all filters
+    /// and are ready to be yielded.
+    row_buffer: VecDeque<Record>,
+    /// Phantom data to associate the iterator with the store type `S`.
+    _store_phantom: PhantomData<S>,
 }
 
-impl<S: ColumnarBanyanStore> ColumnarResultIterator<S> {
-    #[allow(clippy::too_many_arguments)] // Necessary arguments for initialization
-    pub(super) fn new(
-        data_definition: Arc<DataDefinition>,
-        needed_columns: Vec<String>,
-        requested_columns: Vec<String>,
-        filters: Vec<ValueFilter>,
-        query_time_range_micros: (Bound<i64>, Bound<i64>),
-        compressed_chunk_iters: BTreeMap<
-            String,
-            Peekable<
-                impl Iterator<Item = Result<FilteredChunk<(u64, RichRangeKey, ColumnChunk), ()>>>
-                    + Send
-                    + 'static, // Ensure the iterator is Send + 'static
-            >,
+impl<S: BanyanRowSeqStore> RowSeqResultIterator<S> {
+    /// Creates a new `RowSeqResultIterator`.
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - The data definition for the stream being queried.
+    /// * `banyan_iter` - The iterator yielding filtered Banyan chunks.
+    /// * `requested_columns` - Columns to include in the output `Record`s.
+    /// * `filters` - Row-level value filters to apply.
+    /// * `query_start_offset` - Inclusive start offset for the query.
+    /// * `query_end_offset_exclusive` - Exclusive end offset for the query.
+    /// * `query_time_range_micros` - Inclusive time bounds for the query.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing the new iterator or a `BanyanRowSeqError` if
+    /// validation fails (e.g., requested/filtered columns not in schema).
+    #[allow(clippy::too_many_arguments)] // Construction needs these parameters
+    pub fn new(
+        schema: Arc<DataDefinition>,
+        banyan_iter: Box<
+            dyn Iterator<Item = anyhow::Result<FilteredChunk<(u64, ChunkKey, RowSeqData), ()>>>
+                + Send,
         >,
+        requested_columns: Vec<String>,
+        filters: Vec<UserFilter>,
         query_start_offset: u64,
-        query_end_offset: u64,
+        query_end_offset_exclusive: u64,
+        query_time_range_micros: (Bound<i64>, Bound<i64>),
     ) -> Result<Self> {
-        // Box the iterators for dynamic dispatch storage in the struct
-        let boxed_iters = compressed_chunk_iters
-            .into_iter()
-            .map(|(k, v)| (k, v.boxed().peekable())) // Assuming boxed() helper is defined
-            .collect();
+        // --- Validate Inputs ---
+        // Ensure requested columns exist in the schema
+        for col_name in &requested_columns {
+            if schema.get_col_def(col_name).is_none() {
+                error!(column = %col_name, "Requested column not found in schema");
+                return Err(BanyanRowSeqError::ColumnNotFound(col_name.clone()));
+            }
+        }
+        // Ensure filtered columns exist in the schema
+        for filter in &filters {
+            if schema.get_col_def(&filter.column_name).is_none() {
+                error!(column = %filter.column_name, "Column specified in filter not found in schema");
+                return Err(BanyanRowSeqError::ColumnNotFound(
+                    filter.column_name.clone(),
+                ));
+            }
+            // TODO: Add validation comparing filter.value type with schema column type?
+        }
+        // --- End Validation ---
+
+        debug!(
+            ?requested_columns,
+            num_filters = filters.len(),
+            query_offset = ?(query_start_offset, query_end_offset_exclusive),
+            query_time = ?query_time_range_micros,
+            "Creating RowSeqResultIterator"
+        );
 
         Ok(Self {
-            data_definition,
-            needed_columns,
+            schema,
+            banyan_iter,
             requested_columns,
             filters,
+            query_start_offset,
+            query_end_offset_exclusive,
             query_time_range_micros,
-            compressed_chunk_iters: boxed_iters,
-            current_absolute_offset: query_start_offset,
-            query_end_offset,
-            current_decompressed_chunk_cache: BTreeMap::new(),
-            current_chunk_range: 0..0,
+            current_chunk_cache: None,
+            current_chunk_key: None,
+            // Start seeking from the query's beginning offset
+            next_absolute_offset: query_start_offset,
+            row_buffer: VecDeque::new(),
             _store_phantom: PhantomData,
         })
     }
 
-    /// Loads and decompresses the next set of aligned chunks covering the `target_offset`.
-    /// Returns `Ok(true)` if a chunk was loaded, `Ok(false)` if the target offset cannot be reached
-    /// (end of iteration or skipped gap), or `Err` on failure.
-    /// Updates `self.current_absolute_offset` if a gap is skipped.
-    // --- REVISED load_next_chunk ---
-    fn load_next_chunk(&mut self, target_offset: u64) -> Result<bool> {
-        debug!(
-            "load_next_chunk(target_offset={}) - Current state: offset={}, cache_range={:?}",
-            target_offset, self.current_absolute_offset, self.current_chunk_range
+    /// Attempts to fill the internal `row_buffer` by processing the next relevant
+    /// chunk from the Banyan iterator.
+    ///
+    /// This involves:
+    /// 1. Getting the next `FilteredChunk` from `banyan_iter`.
+    /// 2. Skipping chunks that are entirely before the `next_absolute_offset`.
+    /// 3. Decompressing columns needed for filtering and requested output.
+    /// 4. Iterating through rows within the chunk:
+    ///    - Skipping rows outside the query's offset range.
+    ///    - Applying the time range filter.
+    ///    - Reconstructing the row `Record`.
+    ///    - Applying user value filters.
+    ///    - Adding passing rows (projected to `requested_columns`) to `row_buffer`.
+    /// 5. Updating the `current_chunk_cache` and `current_chunk_key`.
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(true)` - If the buffer was successfully populated with at least one row.
+    /// * `Ok(false)` - If the Banyan iterator is exhausted or no more relevant chunks were found.
+    /// * `Err(BanyanRowSeqError)` - If an error occurred during chunk retrieval, decompression, or reconstruction.
+    fn fill_buffer(&mut self) -> Result<bool> {
+        trace!(
+            next_absolute_offset = self.next_absolute_offset,
+            query_end_offset = self.query_end_offset_exclusive,
+            buffer_current_len = self.row_buffer.len(),
+            "Attempting to fill row buffer"
         );
-        self.current_decompressed_chunk_cache.clear();
-        let mut anchor_range: Option<Range<u64>> = None;
-        let mut anchor_key: Option<RichRangeKey> = None;
-        let mut next_candidate_start = u64::MAX;
 
-        trace!(" -> Phase 1: Probing columns...");
-        for col_name in &self.needed_columns {
-            let iter = self
-                .compressed_chunk_iters
-                .get_mut(col_name)
-                .ok_or_else(|| ColumnarError::ColumnNotFound(col_name.clone()))?;
+        // Stop if we've already processed past the query's end offset
+        if self.next_absolute_offset >= self.query_end_offset_exclusive {
+            trace!("Reached query end offset. Buffer fill stops.");
+            return Ok(false); // Indicate no more data can be added
+        }
 
-            trace!("  --> Probing column: {}", col_name);
-            loop {
-                match iter.peek() {
-                    Some(Ok(peeked_filtered_chunk)) => {
-                        if peeked_filtered_chunk.data.is_empty() {
-                            trace!(
-                                "      Skipping empty FilteredChunk (range {:?}) during pre-skip",
-                                peeked_filtered_chunk.range
-                            );
-                            iter.next();
-                            continue;
-                        }
-                        let key = &peeked_filtered_chunk.data[0].1;
-                        let chunk_range = key.start_offset..(key.start_offset + key.count);
-                        if chunk_range.end <= target_offset {
-                            trace!(
-                                "      Skipping chunk range {:?} (ends before target {})",
-                                chunk_range,
-                                target_offset
-                            );
-                            iter.next();
-                        } else {
-                            trace!(
-                                "      Found candidate chunk range {:?} with key {:?}",
-                                chunk_range,
-                                key
-                            );
-                            break;
-                        }
+        // --- Step 1: Get the next relevant RowSeqData chunk from Banyan ---
+        let (chunk_key, chunk_data) = loop {
+            match self.banyan_iter.next() {
+                Some(Ok(filtered_chunk)) => {
+                    // Banyan yields FilteredChunk which contains matching elements.
+                    // In our setup, each relevant leaf yields one element tuple: (offset, key, value)
+                    trace!(banyan_range = ?filtered_chunk.range, data_items = filtered_chunk.data.len(), "Processing FilteredChunk from Banyan");
+
+                    if filtered_chunk.data.is_empty() {
+                        // This might happen if the query pruned everything within the chunk range?
+                        trace!("FilteredChunk data is empty, skipping.");
+                        continue;
                     }
-                    Some(Err(_)) => {
-                        error!(
-                            "      Error peeking iterator during pre-skip for column {}",
-                            col_name
+                    // We expect exactly one item matching our RowSeqData structure per relevant leaf
+                    if filtered_chunk.data.len() > 1 {
+                        warn!(
+                            num_items = filtered_chunk.data.len(),
+                            "Received FilteredChunk with more than one item, using only the first."
                         );
-                        return Err(iter.next().unwrap().err().unwrap().into());
+                    }
+
+                    // Extract the key and value (RowSeqData) from the first item
+                    // The first element of the tuple (offset) is Banyan's internal offset, less relevant here than the key's offset.
+                    let (_, key, value) = filtered_chunk.data.into_iter().next().unwrap();
+
+                    // Calculate chunk's absolute offset range (exclusive end)
+                    let chunk_end_offset_exclusive =
+                        key.start_offset.saturating_add(key.count as u64);
+
+                    debug!(
+                        loaded_chunk_key = ?key,
+                        loaded_chunk_offset_range = ?(key.start_offset..chunk_end_offset_exclusive),
+                        loaded_chunk_time_range=? (key.min_timestamp_micros..=key.max_timestamp_micros),
+                        "Chunk yielded by Banyan iterator"
+                    );
+
+                    // --- Filter 1a: Skip chunks entirely *before* the next needed offset ---
+                    // If the chunk ends before or exactly at the offset we're looking for next, skip it.
+                    if chunk_end_offset_exclusive <= self.next_absolute_offset {
+                        trace!(
+                            ?key,
+                            chunk_end = chunk_end_offset_exclusive,
+                            next_req = self.next_absolute_offset,
+                            "Skipping chunk: ends before next needed offset."
+                        );
+                        continue; // Get the next chunk from Banyan
+                    }
+
+                    // --- Filter 1b: Stop if chunk starts *after* the query ends ---
+                    // If the chunk starts at or after the query's exclusive end, we're done.
+                    if key.start_offset >= self.query_end_offset_exclusive {
+                        trace!(
+                            ?key,
+                            query_end = self.query_end_offset_exclusive,
+                            "Stopping iteration: Chunk starts at or after query end offset."
+                        );
+                        return Ok(false); // Indicate Banyan iterator is effectively exhausted for this query
+                    }
+
+                    // This chunk is potentially relevant (overlaps with the remaining query offset range)
+                    trace!(?key, "Found relevant chunk from Banyan iterator");
+                    break (key, value); // Proceed to decompress this chunk
+                }
+                Some(Err(e)) => {
+                    error!("Error fetching chunk from Banyan iterator: {}", e);
+                    // Wrap the anyhow::Error from Banyan into our StoreError variant
+                    return Err(BanyanRowSeqError::StoreError(e));
+                }
+                None => {
+                    trace!("Banyan iterator exhausted.");
+                    return Ok(false); // Indicate no more chunks are available
+                }
+            }
+        }; // End loop to find next relevant chunk
+
+        // --- Step 2: Decompress columns needed for this chunk ---
+        let decompress_span = tracing::debug_span!(
+            "decompress_chunk_columns",
+            chunk_offset = chunk_key.start_offset,
+            chunk_rows = chunk_key.count
+        )
+        .entered();
+
+        let mut decompressed_cache = HashMap::new();
+        // Determine which columns are needed: requested output + filter columns + timestamp (if time filtering)
+        let mut needed_columns = self.requested_columns.clone();
+        for filter in &self.filters {
+            needed_columns.push(filter.column_name.clone());
+        }
+        let has_time_filter = self.query_time_range_micros != (Bound::Unbounded, Bound::Unbounded);
+        if has_time_filter {
+            needed_columns.push("timestamp".to_string());
+        }
+        needed_columns.sort(); // Sort for potential caching benefits later
+        needed_columns.dedup(); // Remove duplicates
+
+        trace!(needed = ?needed_columns, "Decompressing needed columns for chunk");
+
+        for col_name in &needed_columns {
+            match compression::decompress_column_from_chunk(&chunk_data, col_name, &self.schema) {
+                Ok(decompressed_vec_opt) => {
+                    // Basic validation: check decompressed length against chunk metadata
+                    if decompressed_vec_opt.len() != chunk_key.count as usize {
+                        error!( column=%col_name, expected_rows=chunk_key.count, decompressed_rows=decompressed_vec_opt.len(), "Decompressed column length mismatch!" );
+                        return Err(BanyanRowSeqError::DecompressionError(format!(
+                            "Decompression consistency error: Column '{}' decompressed to {} rows, but chunk key expected {}",
+                            col_name,
+                            decompressed_vec_opt.len(),
+                            chunk_key.count
+                        )));
+                    }
+                    trace!(column=%col_name, rows=decompressed_vec_opt.len(), "Decompressed column successfully");
+                    decompressed_cache.insert(col_name.clone(), Arc::new(decompressed_vec_opt));
+                }
+                Err(BanyanRowSeqError::ColumnNotFound(_)) => {
+                    // This is expected if the column was entirely NULL in this chunk.
+                    // The decompressor handles this by returning vec![None; num_rows].
+                    // We might get this error if schema lookup *itself* failed inside decompress,
+                    // which shouldn't happen if schema validation passed in `new`.
+                    // Let's assume `decompress_column_from_chunk` handles the "all null" case internally now.
+                    // Re-check `decompress_column_from_chunk`: it *does* handle the "not in map" case.
+                    // So, if we get ColumnNotFound *here*, it means the schema lookup failed, which is bad.
+                    warn!(column = %col_name, "Decompression failed: Column not found in schema (should have been caught earlier). Treating as missing data.");
+                    // Insert a vector of Nones, but log a warning
+                    let null_vec = vec![None; chunk_key.count as usize];
+                    decompressed_cache.insert(col_name.clone(), Arc::new(null_vec));
+                }
+                Err(e) => {
+                    // Propagate other decompression errors
+                    error!(column = %col_name, error = ?e, "Error during column decompression");
+                    return Err(e);
+                }
+            }
+        }
+        drop(decompress_span);
+
+        // --- Step 3: Reconstruct rows, filter (Offset, Time, Value), add to buffer ---
+        let reconstruct_span =
+            tracing::debug_span!("reconstruct_and_filter", chunk_rows = chunk_key.count).entered();
+        let mut rows_added_to_buffer = 0;
+        let mut rows_processed_in_chunk = 0;
+        let mut rows_passing_all_filters = 0;
+
+        // Iterate through each logical row *within the current chunk*
+        for relative_idx in 0..chunk_key.count {
+            rows_processed_in_chunk += 1;
+            let current_absolute_offset = chunk_key.start_offset + relative_idx as u64;
+
+            // --- Filter 2: Check Offset Range ---
+            // Skip if before the start offset we're currently seeking *or* at/after the query end offset.
+            if current_absolute_offset < self.next_absolute_offset
+                || current_absolute_offset >= self.query_end_offset_exclusive
+            {
+                trace!(
+                    absolute_offset = current_absolute_offset,
+                    query_range = ?(self.next_absolute_offset, self.query_end_offset_exclusive),
+                    "Skipping row: outside effective query offset range [{}, {})",
+                    self.next_absolute_offset, self.query_end_offset_exclusive
+                );
+                continue;
+            }
+
+            // --- Get Timestamp for Time Filter (if needed) ---
+            // We need the timestamp value *before* full row reconstruction if time filtering is active.
+            let row_timestamp_micros: Option<i64> = if has_time_filter {
+                match decompressed_cache.get("timestamp") {
+                    Some(ts_arc) => {
+                        // Get the Option<Value> for this row index
+                        match ts_arc.get(relative_idx as usize).cloned().flatten() {
+                            Some(Value::Timestamp(ts)) => Some(ts),
+                            Some(other) => {
+                                warn!(absolute_offset = current_absolute_offset, unexpected_type = ?other, "Found non-Timestamp value in timestamp column cache");
+                                None // Treat type mismatch as non-matching timestamp
+                            }
+                            None => None, // Timestamp is NULL
+                        }
                     }
                     None => {
-                        trace!(
-                            "      Iterator exhausted during pre-skip for column {}",
-                            col_name
+                        // This shouldn't happen if 'timestamp' was added to needed_columns
+                        error!(
+                            absolute_offset = current_absolute_offset,
+                            "Timestamp column missing from cache despite time filter being active"
                         );
-                        break;
+                        None // Treat missing cache as non-matching timestamp
                     }
                 }
-            }
+            } else {
+                None // No time filter, don't need the timestamp value here
+            };
 
-            match iter.peek() {
-                Some(Ok(chunk)) => {
-                    if chunk.data.is_empty() {
-                        trace!("      Peeked chunk is empty FilteredChunk (range {:?}), ignoring for anchoring.", chunk.range);
-                        next_candidate_start = next_candidate_start.min(chunk.range.start);
-                        continue;
-                    }
-                    let key = chunk.data[0].1.clone();
-                    let chunk_range = key.start_offset..(key.start_offset + key.count);
-                    trace!(
-                        "      Candidate chunk range {:?} with key {:?}",
-                        chunk_range,
-                        key
-                    );
-                    next_candidate_start = next_candidate_start.min(chunk_range.start);
-                    trace!(
-                        "         (next_candidate_start updated to {})",
-                        next_candidate_start
-                    );
-
-                    if chunk_range.contains(&target_offset) {
-                        trace!("      -> Chunk covers target_offset {}", target_offset);
-                        if anchor_range.is_none() {
-                            trace!(
-                                "         Setting anchor_range={:?}, anchor_key={:?}",
-                                chunk_range,
-                                key
-                            );
-                            anchor_range = Some(chunk_range);
-                            anchor_key = Some(key);
-                        } else {
-                            if Some(&chunk_range) != anchor_range.as_ref()
-                                || Some(&key) != anchor_key.as_ref()
-                            {
-                                error!("Inconsistent chunk keys/ranges found during probe! Column '{}' has {:?}/{:?}, but anchor is {:?}/{:?}.", col_name, chunk_range, key, anchor_range, anchor_key);
-                                return Err(ColumnarError::InconsistentChunkRange {
-                                    banyan_range: chunk_range,
-                                    key_range: key.start_offset..(key.start_offset + key.count),
-                                    column: col_name.clone(),
-                                }
-                                .into());
-                            } else {
-                                trace!("         Chunk matches existing anchor. OK.");
-                            }
-                        }
-                    } else {
-                        trace!(
-                            "      -> Chunk range {:?} starts after target_offset {}",
-                            chunk_range,
-                            target_offset
-                        );
-                    }
-                }
-                Some(Err(_)) => {
-                    error!("      Error peeking iterator for column {}", col_name);
-                    return Err(iter.next().unwrap().err().unwrap().into());
-                }
-                None => {
-                    trace!("      Iterator exhausted for column {}", col_name);
-                }
-            }
-        }
-        trace!(" -> Phase 1 Complete.");
-
-        let (expected_range, expected_key) = match (anchor_range, anchor_key) {
-            (Some(r), Some(k)) => {
-                trace!(
-                    " -> Found anchor covering target {}: range={:?}, key={:?}",
-                    target_offset,
-                    r,
-                    k
-                );
-                (r, k)
-            }
-            (None, None) => {
-                let advance_to =
-                    if next_candidate_start > target_offset && next_candidate_start != u64::MAX {
-                        next_candidate_start
-                    } else {
-                        self.query_end_offset
-                    };
-                trace!(" -> No anchor found covering target {}. Advancing iterator offset to {} (next_candidate_start={}, query_end={}).", target_offset, advance_to, next_candidate_start, self.query_end_offset);
-                self.current_absolute_offset = advance_to;
-                return Ok(false);
-            }
-            _ => unreachable!(
-                "Logic error: anchor_range and anchor_key should be Some or None together"
-            ),
-        };
-
-        trace!(
-            " -> Phase 2: Verifying and loading range {:?} with key {:?}",
-            expected_range,
-            expected_key
-        );
-        let mut loaded_data_cache = BTreeMap::new();
-        let chunk_len = expected_key.count as usize; // Expected sparse length
-
-        for col_name in &self.needed_columns {
-            trace!("  --> Verifying/Loading column: {}", col_name);
-            let iter = self.compressed_chunk_iters.get_mut(col_name).unwrap();
-            match iter.peek() {
-                Some(Ok(chunk)) => {
-                    if chunk.data.is_empty() {
-                        trace!("      Column '{}' chunk is empty FilteredChunk (range {:?}). Treating as NULLs.", col_name, chunk.range);
-                        iter.next();
-                        let null_bitmap = RoaringBitmap::new();
-                        let null_values = Arc::new(vec![None; chunk_len]); // Use chunk_len
-                        loaded_data_cache.insert(
-                            col_name.clone(),
-                            DecompressedColumnData {
-                                bitmap: null_bitmap,
-                                values: null_values,
-                                chunk_key: expected_key.clone(),
-                            },
-                        );
-                        continue;
-                    }
-
-                    let (key, _col_chunk_peek) = (&chunk.data[0].1, &chunk.data[0].2);
-                    let chunk_range = key.start_offset..(key.start_offset + key.count);
-
-                    if chunk_range == expected_range && *key == expected_key {
-                        trace!("      OK: Chunk matches expected range and key. Consuming and decompressing.");
-                        let owned_filtered_chunk = iter.next().unwrap().unwrap();
-                        let (_, _key, col_chunk) =
-                            owned_filtered_chunk.data.into_iter().next().unwrap();
-
-                        let present_bitmap = match &col_chunk {
-                            ColumnChunk::Timestamp { present, .. } => present.bitmap().clone(),
-                            ColumnChunk::Integer { present, .. } => present.bitmap().clone(),
-                            ColumnChunk::Float { present, .. } => present.bitmap().clone(),
-                            ColumnChunk::String { present, .. } => present.bitmap().clone(),
-                            ColumnChunk::Enum { present, .. } => present.bitmap().clone(),
+            // --- Filter 3: Check Time Range ---
+            if has_time_filter {
+                match row_timestamp_micros {
+                    Some(ts) => {
+                        // Check against query bounds
+                        let after_start = match self.query_time_range_micros.0 {
+                            Bound::Included(start) => ts >= start,
+                            Bound::Excluded(start) => ts > start,
+                            Bound::Unbounded => true,
                         };
+                        let before_end = match self.query_time_range_micros.1 {
+                            Bound::Included(end) => ts <= end,
+                            Bound::Excluded(end) => ts < end,
+                            Bound::Unbounded => true,
+                        };
+
+                        if !(after_start && before_end) {
+                            trace!(absolute_offset = current_absolute_offset, timestamp = ts, query_time = ?self.query_time_range_micros, "Skipping row: outside query time range");
+                            continue; // Skip to next row in chunk
+                        }
+                        // Time filter passed
+                    }
+                    None => {
+                        // Timestamp was NULL or missing/invalid type
                         trace!(
-                            "      Extracted bitmap with cardinality {}",
-                            present_bitmap.len()
+                            absolute_offset = current_absolute_offset,
+                            "Skipping row: NULL or invalid timestamp value for time filter"
                         );
-
-                        trace!("      Decompressing dense data...");
-                        let dense_values = compression::decompress_dense_data(&col_chunk)?;
-                        trace!("      Decompressed {} dense values.", dense_values.len());
-
-                        let bitmap_cardinality = present_bitmap.len() as usize;
-                        if dense_values.len() != bitmap_cardinality {
-                            error!("      Dense value count {} does not match bitmap cardinality {} for column '{}'", dense_values.len(), bitmap_cardinality, col_name);
-                            return Err(ColumnarError::InconsistentChunkData {
-                                expected: bitmap_cardinality,
-                                actual: dense_values.len(),
-                                column: col_name.clone(),
-                            }
-                            .into());
-                        }
-
-                        trace!(
-                            "      Reconstructing sparse vector (length {})...",
-                            chunk_len
-                        );
-                        let mut reconstructed_values: Vec<Option<Value>> = vec![None; chunk_len];
-                        let mut dense_iter = dense_values.into_iter();
-                        for present_index in present_bitmap.iter() {
-                            let idx = present_index as usize;
-                            if idx < chunk_len {
-                                if let Some(value) = dense_iter.next() {
-                                    reconstructed_values[idx] = Some(value);
-                                } else {
-                                    error!("Bitmap/value count mismatch during reconstruction (dense iterator exhausted) for column '{}'", col_name);
-                                    return Err(ColumnarError::BitmapValueMismatch {
-                                        index: present_index,
-                                        column: col_name.clone(),
-                                    }
-                                    .into());
-                                }
-                            } else {
-                                error!("Bitmap index {} out of bounds for key count {} for column '{}'", present_index, chunk_len, col_name);
-                                return Err(ColumnarError::BitmapIndexOutOfBounds {
-                                    index: present_index,
-                                    len: chunk_len,
-                                    column: col_name.clone(),
-                                }
-                                .into());
-                            }
-                        }
-                        if dense_iter.next().is_some() {
-                            error!(
-                                "Extra dense values found after reconstruction for column '{}'",
-                                col_name
-                            );
-                            return Err(ColumnarError::ExtraDenseValues {
-                                column: col_name.clone(),
-                            }
-                            .into());
-                        }
-                        trace!("      Reconstruction complete.");
-
-                        loaded_data_cache.insert(
-                            col_name.clone(),
-                            DecompressedColumnData {
-                                bitmap: present_bitmap,
-                                values: Arc::new(reconstructed_values),
-                                chunk_key: expected_key.clone(),
-                            },
-                        );
-                    } else {
-                        error!("Inconsistent chunk found during verification! Column '{}' has range {:?}/key {:?} but expected {:?}/{:?}.", col_name, chunk_range, key, expected_range, expected_key);
-                        return Err(ColumnarError::InconsistentChunkRange {
-                            banyan_range: chunk.range.clone(),
-                            key_range: chunk_range,
-                            column: col_name.clone(),
-                        }
-                        .into());
+                        continue; // Skip rows with null/invalid timestamps if filtering by time
                     }
                 }
-                Some(Err(_)) => {
-                    error!(
-                        "Error peeking iterator during verification for column {}",
-                        col_name
-                    );
-                    return Err(iter.next().unwrap().err().unwrap().into());
-                }
-                None => {
-                    error!("Iterator for column '{}' ended unexpectedly while trying to load chunk for offset {} (expected range {:?}).", col_name, target_offset, expected_range);
-                    return Err(ColumnarError::IteratorStopped(col_name.clone()).into());
-                }
             }
-        }
+            // --- End Time Filter ---
 
-        self.current_decompressed_chunk_cache = loaded_data_cache;
-        self.current_chunk_range = expected_range;
-        trace!(
-            " -> Phase 2 Complete. Successfully loaded cache for range {:?}",
-            self.current_chunk_range
+            // Row has passed Offset and Time filters, now check Value filters.
+            // We need to reconstruct the row (or relevant parts) for this.
+
+            // --- Reconstruct Row (or necessary parts) ---
+            // Optimization: Only reconstruct columns needed for filters OR final output.
+            let needs_reconstruction =
+                !self.filters.is_empty() || !self.requested_columns.is_empty();
+            let mut current_row = Record::new(); // Use BTreeMap for Record
+
+            if needs_reconstruction {
+                let reconstruct_row_span = tracing::trace_span!(
+                    "reconstruct_row",
+                    absolute_offset = current_absolute_offset
+                )
+                .entered();
+                // Use `needed_columns` which includes requested + filtered cols
+                for col_name in &needed_columns {
+                    match decompressed_cache.get(col_name) {
+                        Some(decompressed_col_arc) => {
+                            // Get the Option<Value> for this row index.
+                            // `flatten()` converts Option<&Option<Value>> to Option<Value>
+                            // `cloned()` is needed because `get` returns a reference.
+                            let value_opt = decompressed_col_arc
+                                .get(relative_idx as usize)
+                                .cloned()
+                                .flatten();
+                            current_row.insert(col_name.clone(), value_opt);
+                        }
+                        None => {
+                            // Column was needed but missing from cache (should only happen if decompression failed earlier and logged warning)
+                            // Insert None, consistent with missing data.
+                            current_row.insert(col_name.clone(), None);
+                        }
+                    }
+                }
+                drop(reconstruct_row_span);
+            }
+
+            // --- Filter 4: Apply User Value Filters ---
+            let passes_value_filters = query::apply_user_filters(&current_row, &self.filters);
+
+            if !passes_value_filters {
+                trace!(
+                    absolute_offset = current_absolute_offset,
+                    "Skipping row: failed value filters"
+                );
+                continue; // Skip to next row
+            }
+
+            // --- All Filters Passed ---
+            rows_passing_all_filters += 1;
+            trace!(
+                absolute_offset = current_absolute_offset,
+                "Row passed ALL filters"
+            );
+
+            // Project the reconstructed row to only the columns requested by the user
+            let final_record: Record = self
+                .requested_columns
+                .iter()
+                .map(|req_col| {
+                    // Clone the Option<Value> from the potentially larger `current_row`
+                    let value = current_row.get(req_col).cloned().flatten();
+                    (req_col.clone(), value)
+                })
+                .collect();
+
+            // Add the final record to the output buffer
+            self.row_buffer.push_back(final_record);
+            rows_added_to_buffer += 1;
+        } // End loop over rows within the chunk
+        drop(reconstruct_span);
+
+        debug!(
+            chunk_key = ?chunk_key,
+            rows_in_chunk = rows_processed_in_chunk,
+            rows_passed_filters = rows_passing_all_filters,
+            rows_added_to_buffer,
+            "Finished processing loaded chunk"
         );
-        Ok(true)
-    }
+
+        // Update iterator state with the chunk we just processed
+        self.current_chunk_cache = Some(DecompressedChunkCache {
+            columns: decompressed_cache,
+            _start_offset: chunk_key.start_offset,
+            num_rows: chunk_key.count,
+        });
+        self.current_chunk_key = Some(chunk_key);
+
+        Ok(rows_added_to_buffer > 0) // Return true if we added anything to the buffer
+    } // End fill_buffer
 }
 
-impl<S: ColumnarBanyanStore> Iterator for ColumnarResultIterator<S> {
-    type Item = Result<BTreeMap<String, Option<Value>>>;
+impl<S: BanyanRowSeqStore> Iterator for RowSeqResultIterator<S> {
+    type Item = Result<Record>; // Yields Result<Record, BanyanRowSeqError>
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            trace!(
-                "Iterator::next() loop start, current_offset={}, query_end={}",
-                self.current_absolute_offset,
-                self.query_end_offset
-            );
-            if self.current_absolute_offset >= self.query_end_offset {
+            // Try to yield a row from the buffer first
+            if let Some(row) = self.row_buffer.pop_front() {
+                let yielded_offset = self.next_absolute_offset;
+                // IMPORTANT: Increment the offset tracker *after* yielding
+                self.next_absolute_offset = yielded_offset.saturating_add(1);
                 trace!(
-                    "  Offset {} reached query end {}. Stopping.",
-                    self.current_absolute_offset,
-                    self.query_end_offset
+                    yielded_offset,
+                    new_next_offset = self.next_absolute_offset,
+                    "Yielding row from buffer"
                 );
-                return None;
+                return Some(Ok(row));
             }
 
-            if !self
-                .current_chunk_range
-                .contains(&self.current_absolute_offset)
-            {
+            // If buffer is empty, check if we've reached the end of the query range
+            if self.next_absolute_offset >= self.query_end_offset_exclusive {
                 trace!(
-                    "  Offset {} not in cache range {:?}. Loading next chunk.",
-                    self.current_absolute_offset,
-                    self.current_chunk_range
+                    next_offset = self.next_absolute_offset,
+                    end_offset = self.query_end_offset_exclusive,
+                    "Iterator exhausted (reached query end offset)"
                 );
-                match self.load_next_chunk(self.current_absolute_offset) {
-                    Ok(true) => {
-                        if !self
-                            .current_chunk_range
-                            .contains(&self.current_absolute_offset)
-                        {
-                            error!("Logic Error: load_next_chunk returned true but new range {:?} does not contain target offset {}", self.current_chunk_range, self.current_absolute_offset);
-                            self.current_absolute_offset = self.query_end_offset;
-                            return Some(Err(anyhow!(
-                                "Internal iterator error: Failed to load correct chunk"
-                            )));
-                        }
-                        continue;
-                    }
-                    Ok(false) => {
-                        trace!("    load_next_chunk returned false. Offset potentially advanced to {}. Checking bounds.", self.current_absolute_offset);
-                        continue;
-                    }
-                    Err(e) => {
-                        error!("    load_next_chunk failed: {}", e);
-                        self.current_absolute_offset = self.query_end_offset;
-                        return Some(Err(e));
-                    }
-                }
+                return None; // Query range is fully processed
             }
 
+            // Buffer is empty and we haven't reached the end offset, try to fill it
             trace!(
-                "  Offset {} is within cache range {:?}. Reconstructing row.",
-                self.current_absolute_offset,
-                self.current_chunk_range
+                buffer_len = self.row_buffer.len(),
+                next_abs_offset = self.next_absolute_offset,
+                "Buffer empty, attempting to fill..."
             );
-            let relative_index =
-                (self.current_absolute_offset - self.current_chunk_range.start) as u32;
-            trace!("    Relative index: {}", relative_index);
-            let mut current_row_partial_data: BTreeMap<String, Option<Value>> = BTreeMap::new();
-
-            for col_name in &self.needed_columns {
-                if let Some(decompressed_data) = self.current_decompressed_chunk_cache.get(col_name)
-                {
-                    // Access the value directly from the cached sparse Vec using relative_index
-                    let sparse_index = relative_index as usize;
-                    if let Some(value_opt) = decompressed_data.values.get(sparse_index) {
-                        current_row_partial_data.insert(col_name.clone(), value_opt.clone());
-                        trace!(
-                            "      Column '{}': Value from cache={:?}",
-                            col_name,
-                            value_opt
-                        );
-                    } else {
-                        error!("Cache Inconsistency! Column '{}', relative_idx {}, vec len {}. Cache: {:?}", col_name, relative_index, decompressed_data.values.len(), decompressed_data);
-                        self.current_absolute_offset = self.query_end_offset;
-                        return Some(Err(ColumnarError::CacheIndexOutOfBounds {
-                            index: relative_index,
-                            len: decompressed_data.values.len(),
-                            column: col_name.clone(),
-                        }
-                        .into()));
-                    }
-                } else {
-                    error!("Internal Error: Decompressed data cache missing for needed column '{}' at offset {}", col_name, self.current_absolute_offset);
-                    self.current_absolute_offset = self.query_end_offset;
-                    return Some(Err(anyhow!(
-                        "Internal iterator error: Missing cache data for column {}",
-                        col_name
-                    )));
+            match self.fill_buffer() {
+                Ok(true) => {
+                    // Buffer was refilled, loop again to pop from it
+                    trace!("Buffer refilled, continuing loop");
+                    continue;
+                }
+                Ok(false) => {
+                    // fill_buffer returned false, meaning Banyan iterator is exhausted
+                    // or no more relevant chunks were found. Mark iterator as finished.
+                    trace!("fill_buffer returned false (source exhausted), stopping iterator.");
+                    // Ensure we don't try to fill again
+                    self.next_absolute_offset = self.query_end_offset_exclusive;
+                    return None;
+                }
+                Err(e) => {
+                    // An error occurred while trying to fill the buffer.
+                    error!("Error filling buffer: {}", e);
+                    // Mark iterator as finished to prevent further attempts
+                    self.next_absolute_offset = self.query_end_offset_exclusive;
+                    // Yield the error
+                    return Some(Err(e));
                 }
             }
-
-            let value_filters_pass = apply_value_filters(&current_row_partial_data, &self.filters);
-            trace!("    Value Filters pass: {}", value_filters_pass);
-
-            let mut time_filter_pass = true; // Default to true if no time filter or if value filters failed
-            if value_filters_pass {
-                // Only check time if value filters passed AND a time range is specified
-                if self.query_time_range_micros != (Bound::Unbounded, Bound::Unbounded) {
-                    let ts_col_name = "timestamp";
-                    let ts_opt_val = current_row_partial_data.get(ts_col_name);
-                    time_filter_pass = match ts_opt_val {
-                        Some(Some(Value::Timestamp(ts))) => {
-                            bound_contains(&self.query_time_range_micros, ts)
-                        }
-                        Some(None) | None => {
-                            // Row is missing timestamp or it's NULL. It fails the time filter unless the range is unbounded.
-                            false
-                        }
-                        Some(Some(_other)) => {
-                            warn!(
-                                "Timestamp column '{}' contained unexpected type: {:?}",
-                                ts_col_name, _other
-                            );
-                            false
-                        }
-                    };
-                    trace!(
-                        "    Time filter check: ts_val={:?}, range={:?}, pass={}",
-                        ts_opt_val.cloned().flatten(),
-                        self.query_time_range_micros,
-                        time_filter_pass
-                    );
-                } else {
-                    // No time range specified in query, so time filter passes by default
-                    time_filter_pass = true;
-                    trace!("    Time filter check: skipped (no time range specified in query)");
-                }
-            } else {
-                trace!("    Time filter check: skipped (value filters failed)");
-                // Ensure time_filter_pass is false if value_filters_pass is false
-                time_filter_pass = false;
-            }
-
-            let final_filters_pass = value_filters_pass && time_filter_pass;
-            self.current_absolute_offset += 1;
-
-            if final_filters_pass {
-                // Yield requested columns including None values
-                let result_row: BTreeMap<String, Option<Value>> = self
-                    .requested_columns
-                    .iter()
-                    .map(|req_col_name| {
-                        // Look up the Option<Value> in the map containing all needed columns' data.
-                        // Clone it directly. If the column wasn't present (it should be), default to None.
-                        let value_option = current_row_partial_data
-                            .get(req_col_name) // Option<&Option<Value>>
-                            .map(|option_ref| option_ref.clone()) // Option<Option<Value>>
-                            .unwrap_or(None); // Option<Value> (Handles case where column *wasn't* in partial_data)
-
-                        (req_col_name.clone(), value_option)
-                    })
-                    .collect(); // Collects (String, Option<Value>) tuples
-
-                trace!("    Yielding row (with nulls): {:?}", result_row);
-                return Some(Ok(result_row)); // Yield the map with Option<Value>
-            } else {
-                trace!("    Row failed final filters (value: {}, time: {}). Continuing to next offset.", value_filters_pass, time_filter_pass);
-                continue;
-            }
-        }
-    }
+        } // End loop
+    } // End next()
 }

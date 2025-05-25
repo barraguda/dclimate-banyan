@@ -1,148 +1,144 @@
-//! # Banyan Columnar Storage Library
+//! A time-series storage library using Banyan for efficient persistence.
 //!
-//! This crate provides columnar storage capabilities built on top of the
-//! [Banyan](https://docs.rs/banyan/latest/banyan/) persistence layer.
+//! This library stores time-series data, defined by a user-provided schema
+//! (`DataDefinition`), in a single Banyan tree. Data is chunked and stored
+//! columnarly within `RowSeqData` leaves, allowing for type-specific compression.
 //!
-//! It allows storing structured data efficiently in columns, leveraging Banyan's
-//! content-addressed storage and Merkle B+tree structures for indexing and querying.
-//! This approach is particularly useful for analytical workloads where queries often
-//! access only a subset of columns for a large number of rows.
+//! Features:
+//! - Schema definition (`DataDefinition`, `ColumnDefinition`, `ColumnType`).
+//! - Efficient columnar storage and compression (`RowSeqData`).
+//! - Banyan tree integration for scalable indexing based on row offset and timestamp.
+//! - Append-only data extension (`DatastreamRowSeq::extend`).
+//! - Flexible querying with filtering by:
+//!   - Absolute row offset (`query` with `offset_range`).
+//!   - Timestamp (`query` with `time_range_micros`).
+//!   - Column values (`query` with `filters`).
+//! - Optional state persistence (`load_or_initialize`, `save_state`).
+//! - Pluggable storage backend (`BanyanRowSeqStore` trait, `memory_store` helper).
 //!
-//! ## Key Features
+//! # Quick Start
 //!
-//! *   **Columnar Layout:** Data is stored column by column, improving compression
-//!     and I/O efficiency for column-subset queries.
-//! *   **Banyan Integration:** Built directly on Banyan's storage primitives, inheriting
-//!     its properties like content addressing, deduplication (where applicable), and
-//!     verifiability.
-//! *   **Querying:** Supports filtering data based on values within columns using
-//!     Banyan's range query capabilities, adapted for columnar access.
-//! *   **Data Management:** Provides abstractions (`ColumnarDatastreamManager`,
-//!     `ColumnarBanyanStore`) for managing streams of columnar data.
-//!
-//! ## Core Concepts
-//!
-//! *   **`ColumnarDatastreamManager`:** The main entry point for managing different
-//!     named streams of columnar data.
-//! *   **`ColumnarBanyanStore`:** Represents a single stream of columnar data,
-//!     handling writes, reads, and indexing.
-//! *   **`ColumnDefinition`, `DataDefinition`:** Define the schema (column names and types)
-//!     of the stored data.
-//! *   **`Record`, `Value`:** Represent rows and individual data cell values.
-//! *   **`ValueFilter`, `Comparison`:** Used to specify query conditions.
-//!
-//! ## Example Usage (Conceptual)
-//!
-//! ```rust,ignore
-//! // This is a conceptual example and might not compile directly
-//! use banyan_columnar::{
-//!     ColumnarDatastreamManager, ColumnDefinition, ColumnType, DataDefinition,
-//!     Record, Value, Config, Secrets, Sha256Digest // Assuming necessary imports
+//! ```no_run
+//! use banyan_row_seq_storage::{
+//!     memory_store, BanyanRowSeqError, ColumnDefinition, ColumnType,
+//!     DataDefinition, DatastreamRowSeq, Record, UserFilter, UserFilterOp, Value,
 //! };
-//! use banyan::store::mem::MemStore; // Example using an in-memory store
+//! use banyan::{Config, Secrets};
+//! use std::{collections::BTreeMap, ops::Bound, sync::Arc};
+//! use anyhow::Result; // Use anyhow Result for example simplicity
 //!
-//! async fn run() -> anyhow::Result<()> {
-//!     let store = MemStore::new(usize::max_value(), Sha256Digest::digest);
-//!     let secrets = Secrets::default(); // Or load your actual secrets
-//!     let config = Config::default(); // Or configure as needed
-//!
-//!     let manager = ColumnarDatastreamManager::new(config, secrets, store);
-//!
-//!     // Define the schema
+//! fn main() -> Result<()> {
+//!     // 1. Define Schema
 //!     let schema = DataDefinition::new(vec![
-//!         ColumnDefinition::new("timestamp".into(), ColumnType::Timestamp),
-//!         ColumnDefinition::new("value".into(), ColumnType::Float64),
-//!         ColumnDefinition::new("sensor_id".into(), ColumnType::Text),
-//!     ])?;
-//!
-//!     // Get or create a columnar store for a specific stream name
-//!     let mut columnar_store = manager.get_or_create_store("sensor_data".into(), schema).await?;
-//!
-//!     // Prepare some data
-//!     let record1 = Record::new(vec![
-//!         Value::Timestamp(1678886400_000_000_000), // Example timestamp
-//!         Value::Float64(23.5),
-//!         Value::Text("sensor_A".into()),
+//!         ColumnDefinition { name: "timestamp".to_string(), column_type: ColumnType::Timestamp },
+//!         ColumnDefinition { name: "temperature".to_string(), column_type: ColumnType::Float },
+//!         ColumnDefinition { name: "device_id".to_string(), column_type: ColumnType::String },
 //!     ]);
-//!     // ... add more records
 //!
-//!     // Append data
-//!     columnar_store.append(vec![record1]).await?;
+//!     // 2. Setup Store and Datastream
+//!     let store = memory_store(1024 * 1024); // 1MB in-memory store
+//!     let config = Config::default(); // Default Banyan config
+//!     let secrets = Secrets::default(); // Default secrets (no encryption)
 //!
-//!     // Querying (details depend on specific query interface)
-//!     // let results = columnar_store.query(...).await?;
+//!     let mut ds = DatastreamRowSeq::load_or_initialize(
+//!         store,
+//!         config,
+//!         secrets,
+//!         None, // No persistence file path
+//!         schema,
+//!     )?;
+//!
+//!     // 3. Extend with Data
+//!     let mut record1 = Record::new();
+//!     record1.insert("timestamp".to_string(), Some(Value::Timestamp(1_000_000))); // 1 second epoch
+//!     record1.insert("temperature".to_string(), Some(Value::Float(23.5)));
+//!     record1.insert("device_id".to_string(), Some(Value::String("dev-01".to_string())));
+//!
+//!     let mut record2 = Record::new();
+//!     record2.insert("timestamp".to_string(), Some(Value::Timestamp(2_000_000))); // 2 seconds epoch
+//!     record2.insert("temperature".to_string(), Some(Value::Float(24.1)));
+//!     record2.insert("device_id".to_string(), Some(Value::String("dev-02".to_string())));
+//!
+//!     ds.extend(&[record1, record2])?;
+//!     println!("Extended datastream. Total rows: {}", ds.total_rows());
+//!
+//!     // 4. Query Data
+//!     let results_iter = ds.query(
+//!         vec!["timestamp".to_string(), "temperature".to_string()], // Select columns
+//!         (Bound::Unbounded, Bound::Unbounded), // All offsets
+//!         vec![], // No value filters
+//!         (Bound::Included(1_500_000), Bound::Unbounded), // Time >= 1.5s
+//!     )?;
+//!
+//!     println!("Query Results:");
+//!     for result in results_iter {
+//!         match result {
+//!             Ok(record) => println!("  {:?}", record),
+//!             Err(e) => eprintln!("  Error retrieving record: {}", e),
+//!         }
+//!     }
+//!
+//!     // 5. (Optional) Save State if path was provided
+//!     // ds.save_state()?;
 //!
 //!     Ok(())
 //! }
 //! ```
 
-// --- Modules ---
-
-/// Compression algorithms and utilities. (Potentially internal)
+// Declare modules, making their public items accessible within the crate
 mod compression;
-/// Iterators for traversing columnar data. (Potentially internal)
+mod datastream;
+mod error;
 mod iterator;
-/// Core data management traits and implementations.
-pub mod manager;
-/// Query representation and execution logic.
-pub mod query;
-/// Core data types, schema definitions, and Banyan tree type definitions.
-pub mod types;
+mod query;
+// mod store;
+mod types;
 
-/// Tests module (only compiled when testing)
-#[cfg(test)]
-mod test;
+// #[cfg(test)]
+// mod test;
 
-// --- Main Library Exports ---
-// Re-export core Banyan configuration and secrets types for convenience.
+// --- Public Re-exports ---
+// Re-export the most commonly used types and functions for easier access.
+
+// Core data model and schema types
+pub use crate::types::{
+    ChunkKey, ChunkSummary, ColumnDefinition, ColumnType, DataDefinition, Record, UserFilter,
+    UserFilterOp, Value,
+};
+
+// Main datastream entry point
+pub use crate::datastream::DatastreamRowSeq;
+
+// Error type
+pub use crate::error::BanyanRowSeqError;
+
+use banyan::store::{BlockWriter, ReadOnlyStore};
+// Re-export key Banyan configuration types
 pub use banyan::{Config, Secrets};
-// Re-export the digest type used for links/hashes.
-pub use banyan_utils::tags::Sha256Digest; // Or your specific Digest type if different
 
-/// Exports related to data management and storage access.
-pub mod store {
-    pub use crate::manager::{ColumnarBanyanStore, ColumnarDatastreamManager};
+// Re-export key external types needed for interaction
+pub use anyhow::Result;
+use banyan_utils::tags::Sha256Digest;
+// Often useful for application-level error handling
+pub use libipld::Cid;
+
+// Example: Re-exporting IPFS store if it were commonly used directly
+// pub use banyan_utils::ipfs::IpfsStore;
+
+// Example: Re-exporting digest type if needed externally
+// pub use banyan_utils::tags::Sha256Digest;
+
+/// A trait alias for the required capabilities of a Banyan store used by this library.
+///
+/// This simplifies type signatures for `DatastreamRowSeq`. The store must be readable,
+/// writable (for transactions), cloneable, thread-safe, and have a static lifetime.
+pub trait BanyanRowSeqStore:
+    ReadOnlyStore<Sha256Digest> + BlockWriter<Sha256Digest> + Clone + Send + Sync + 'static
+{
 }
 
-/// Exports related to querying and filtering data.
-pub mod querying {
-    pub use crate::query::{Comparison, ValueFilter};
-    // Potentially add Query structure or QueryBuilder here if they exist.
+// Blanket implementation: Any type satisfying the bounds implements the alias.
+impl<S> BanyanRowSeqStore for S where
+    S: ReadOnlyStore<Sha256Digest> + BlockWriter<Sha256Digest> + Clone + Send + Sync + 'static
+{
 }
-
-/// IPFS
-use banyan::store::BlockWriter;
-pub use banyan_utils::ipfs::IpfsStore;
-
-pub type MemStore = banyan::store::MemStore<Sha256Digest>;
-
-pub fn memory_store(max_size: usize) -> MemStore {
-    MemStore::new(max_size, Sha256Digest::digest)
-}
-
-pub fn ipfs_available() -> bool {
-    IpfsStore.put(vec![]).is_ok()
-}
-
-/// Exports related to data structures, schema, and types used by the library.
-pub mod data {
-    pub use crate::types::{
-        ColumnChunk, ColumnDefinition, ColumnType, ColumnarTreeTypes, DataDefinition, Record,
-        RichRangeKey, RichRangeSummary, Value,
-    };
-    // Consider if ColumnChunk, RichRangeKey, RichRangeSummary are truly needed
-    // in the public API or if they are implementation details. Start minimal.
-    // Keep: ColumnDefinition, ColumnType, DataDefinition, Record, Value as these define data.
-    // Keep: ColumnarTreeTypes maybe, if users need to interact with Banyan's specifics.
-}
-
-// --- Optional: Prelude ---
-// If the library grows and certain types are used very frequently,
-// you might consider adding a prelude module.
-// pub mod prelude {
-//     pub use crate::manager::{ColumnarBanyanStore, ColumnarDatastreamManager};
-//     pub use crate::query::{Comparison, ValueFilter};
-//     pub use crate::types::{ColumnDefinition, ColumnType, DataDefinition, Record, Value};
-//     pub use banyan::{Config, Secrets};
-//     pub use banyan_utils::tags::Sha256Digest;
-// }

@@ -1,286 +1,305 @@
-use crate::types::Value;
+//! Query logic for Banyan tree traversal and row-level filtering.
+use crate::{
+    error::{BanyanRowSeqError, Result},
+    types::{ChunkKey, ChunkSummary, Record, RowSeqTT, UserFilter, UserFilterOp, Value},
+};
+use banyan::{
+    index::{BranchIndex, CompactSeq, LeafIndex},
+    query::Query, // Import the Banyan Query trait
+};
+use std::ops::Bound;
+use tracing::{debug, trace, warn}; // Added trace, warn
 
-// --- Banyan Query Logic ---
-use super::types::{ColumnarTreeTypes, RichRangeKey};
-use banyan::index::CompactSeq;
-use banyan::index::{BranchIndex, LeafIndex};
-use banyan::query::Query;
-use std::{collections::BTreeMap, fmt::Debug, ops::Bound};
-use tracing::{debug, error, info, trace, warn};
-
-/// Banyan Query struct - only contains offset and time ranges for Banyan tree traversal
+/// The query structure executed during Banyan tree traversal.
+///
+/// This query primarily uses offset and timestamp ranges defined in `ChunkKey`
+/// and `ChunkSummary` to prune branches of the tree that cannot possibly
+/// contain relevant data.
+///
+/// **TODO:** Enhance this query to leverage potential future value summaries
+/// (min/max, bloom filters) stored in `ChunkSummary` for more aggressive pruning.
 #[derive(Debug, Clone)]
-pub struct ColumnarBanyanQuery {
-    /// TODO: Docs
+pub struct RowSeqBanyanQuery {
+    /// The desired absolute row offset range (inclusive start, exclusive end).
     pub offset_range: (Bound<u64>, Bound<u64>),
-    /// TODO: Docs
+    /// The desired timestamp range (microseconds UTC, inclusive bounds).
     pub time_range_micros: (Bound<i64>, Bound<i64>),
+    // Potential future fields:
+    // pub value_filters_summary: PrecomputedSummaryFilters,
 }
 
-// Helper function to check if two potentially unbounded ranges intersect.
-// Ranges are inclusive start, exclusive end for comparison logic.
+/// Helper function to check if two potentially unbounded ranges overlap.
+///
+/// This is crucial for determining if a query range intersects with the
+/// range covered by a Banyan tree node (leaf key or branch summary).
 fn ranges_intersect<T: PartialOrd>(
     r1_start: Bound<T>,
     r1_end: Bound<T>,
     r2_start: Bound<T>,
     r2_end: Bound<T>,
 ) -> bool {
-    // Check if r1 is entirely before r2
-    let r1_before_r2 = match (r1_end, r2_start) {
+    let r1_before_r2 = match (&r1_end, &r2_start) {
         (Bound::Included(e1), Bound::Included(s2)) => e1 < s2,
-        (Bound::Excluded(e1), Bound::Included(s2)) => e1 <= s2, // if end is excluded, need <=
-        (Bound::Included(e1), Bound::Excluded(s2)) => e1 <= s2, // if start is excluded, need <=
+        (Bound::Excluded(e1), Bound::Included(s2)) => e1 <= s2,
+        (Bound::Included(e1), Bound::Excluded(s2)) => e1 <= s2,
         (Bound::Excluded(e1), Bound::Excluded(s2)) => e1 <= s2,
-        (_, Bound::Unbounded) => false, // r1 cannot be before unbounded start
-        (Bound::Unbounded, _) => false, // unbounded end cannot be before anything
-        _ => false,                     // Should handle all cases, but default false
+        (_, Bound::Unbounded) => false,
+        (Bound::Unbounded, _) => false,
     };
-
-    // Check if r2 is entirely before r1
-    let r2_before_r1 = match (r2_end, r1_start) {
+    let r2_before_r1 = match (&r2_end, &r1_start) {
         (Bound::Included(e2), Bound::Included(s1)) => e2 < s1,
         (Bound::Excluded(e2), Bound::Included(s1)) => e2 <= s1,
         (Bound::Included(e2), Bound::Excluded(s1)) => e2 <= s1,
         (Bound::Excluded(e2), Bound::Excluded(s1)) => e2 <= s1,
         (_, Bound::Unbounded) => false,
         (Bound::Unbounded, _) => false,
-        _ => false,
     };
-
-    // They intersect if neither is entirely before the other
     !r1_before_r2 && !r2_before_r1
 }
 
-impl Query<ColumnarTreeTypes> for ColumnarBanyanQuery {
-    /// Determine which elements within a leaf *might* be relevant.
-    /// This is called *after* intersecting for the branch containing the leaf.
-    /// We simplify this: if the leaf's overall key range intersects the query,
-    /// mark all elements provided in `res` as potentially relevant. The iterator
-    /// will perform exact offset filtering later.
+impl Query<RowSeqTT> for RowSeqBanyanQuery {
+    /// Called at leaf nodes. Determines if the chunk represented by this leaf
+    /// *might* contain data relevant to the query.
+    ///
+    /// It checks if the chunk's offset and time range (from `ChunkKey`) overlaps
+    /// with the query's ranges. If they don't overlap, all elements (`res` bits)
+    /// corresponding to this leaf are set to `false`, pruning the entire chunk.
     fn containing(
         &self,
-        _leaf_start_offset: u64,
-        index: &LeafIndex<ColumnarTreeTypes>,
+        _offset: u64,
+        index: &banyan::index::LeafIndex<RowSeqTT>,
         res: &mut [bool],
     ) {
-        // Check if the KeySeq is empty. This shouldn't happen for a valid leaf
-        // node generated by our extend logic, but handle defensively.
+        // A leaf index corresponds to a single RowSeqData chunk.
+        // The key contains the necessary range info.
         if index.keys.is_empty() {
-            warn!("Query::containing called on leaf with empty keys sequence!");
-            for r in res.iter_mut() {
-                *r = false;
-            }
+            warn!("RowSeqBanyanQuery::containing called on leaf with empty keys!");
+            res.fill(false); // Mark all as non-matching
             return;
         }
+        // Get the ChunkKey for this leaf
+        let key: ChunkKey = index.keys.first();
 
-        // Since keys is not empty, .first() is guaranteed to succeed and return RichRangeKey.
-        // No `if let Some` needed here.
-        let key: RichRangeKey = index.keys.first(); // Directly get the first key
-
-        let key_offset_start = Bound::Included(key.start_offset);
-        let key_offset_end = Bound::Excluded(key.start_offset.saturating_add(key.count));
-        let key_time_start = Bound::Included(key.min_timestamp_micros);
-        let key_time_end = Bound::Included(key.max_timestamp_micros);
-
-        trace!(
-            key = ?key,
-            query_offset = ?self.offset_range,
-            query_time = ?self.time_range_micros,
-            "Query::containing check"
-        );
+        // Check if the *chunk's* ranges overlap with the *query's* ranges
+        let chunk_offset_start = Bound::Included(key.start_offset);
+        // Exclusive end offset for the chunk
+        let chunk_offset_end = Bound::Excluded(key.start_offset.saturating_add(key.count as u64));
+        let chunk_time_start = Bound::Included(key.min_timestamp_micros);
+        let chunk_time_end = Bound::Included(key.max_timestamp_micros); // Summary range is inclusive
 
         let offset_intersects = ranges_intersect(
-            key_offset_start,
-            key_offset_end,
+            chunk_offset_start,
+            chunk_offset_end,
             self.offset_range.0,
             self.offset_range.1,
         );
         let time_intersects = ranges_intersect(
-            key_time_start,
-            key_time_end,
+            chunk_time_start,
+            chunk_time_end,
             self.time_range_micros.0,
             self.time_range_micros.1,
         );
 
-        if offset_intersects && time_intersects {
-            trace!(
-                "  -> Intersects (Offset: {}, Time: {}). Maintaining res state (len {}).",
-                offset_intersects,
-                time_intersects,
-                res.len()
-            );
-            // If the key intersects, we don't need to change `res`. Elements marked true
-            // by `intersecting` remain true. The iterator handles fine-grained filtering.
-        } else {
-            trace!(
-                "  -> Key does NOT intersect query. Marking res (len {}) as false.",
-                res.len()
-            );
-            // If the key doesn't intersect, prune all elements in this leaf represented by `res`.
-            for r in res.iter_mut() {
-                *r = false;
-            }
+        // TODO: Add checks against value summaries here if they exist in ChunkSummary/Key
+
+        let keep_chunk = offset_intersects && time_intersects; // && value_summary_intersects;
+
+        trace!(leaf_key = ?key, ?offset_intersects, ?time_intersects, %keep_chunk, "BanyanQuery::containing check");
+
+        // *** ADDED BANYAN QUERY LOGGING ***
+        debug!(
+            query_offset=?self.offset_range,
+            query_time=?self.time_range_micros,
+            leaf_offset=_offset, // Banyan's leaf offset (might differ from key.start_offset if tree structure changes?)
+            leaf_key = ?key,    // The key defining the chunk's range
+            ?offset_intersects,
+            ?time_intersects,
+            %keep_chunk,
+            "BanyanQuery::containing decision"
+        );
+
+        // If the chunk key/summary doesn't intersect, prune all elements within it.
+        // Otherwise, keep the existing `res` bits (set by `intersecting` on parent).
+        // The final row-level filtering happens in the iterator.
+        if !keep_chunk {
+            res.fill(false);
         }
+        // No need to iterate res elements here, containing applies to the whole leaf index.
     }
 
-    /// Determine which child branches *might* contain relevant data based on their summaries.
-    fn intersecting(
-        &self,
-        _offset: u64, // Base offset of the branch within the stream (unused)
-        index: &BranchIndex<ColumnarTreeTypes>,
-        res: &mut [bool], // Input/Output: indicates which children are currently considered relevant
-    ) {
+    /// Called at branch nodes. Determines which child branches *might* contain
+    /// relevant data based on their `ChunkSummary`.
+    ///
+    /// It iterates through the summaries of child nodes. For each child whose
+    /// corresponding `res` bit is currently `true`, it checks if the child's
+    /// summarized offset and time range overlaps with the query's ranges.
+    /// If they don't overlap, the child's `res` bit is set to `false`, pruning
+    /// that entire subtree.
+    fn intersecting(&self, _offset: u64, index: &BranchIndex<RowSeqTT>, res: &mut [bool]) {
+        // Iterate through child summaries and their corresponding result bits
         for (i, summary) in index.summaries.as_ref().iter().enumerate() {
-            // Only check summaries that are currently considered relevant
-            if res[i] {
-                // Define the summary's ranges (inclusive start, exclusive end for offset)
-                let summary_offset_start = Bound::Included(summary.start_offset);
-                let summary_offset_end =
-                    Bound::Excluded(summary.start_offset.saturating_add(summary.total_count));
-                let summary_time_start = Bound::Included(summary.min_timestamp_micros);
-                let summary_time_end = Bound::Included(summary.max_timestamp_micros); // Inclusive
+            // Only check children that haven't already been pruned by ancestor checks
+            if res.get(i).map_or(false, |&r| r) {
+                // Define the summary's ranges
+                let summary_offset_start = Bound::Included(&summary.start_offset);
+                // Summary end is exclusive: start + total_count
+                let summary_offset_end_val =
+                    summary.start_offset.saturating_add(summary.total_count);
+                let summary_offset_end = Bound::Excluded(&summary_offset_end_val);
 
-                trace!(
-                    child_idx = i,
-                    summary = ?summary,
-                    query_offset = ?self.offset_range,
-                    query_time = ?self.time_range_micros,
-                    "Query::intersecting check"
-                );
+                let summary_time_start = Bound::Included(&summary.min_timestamp_micros);
+                let summary_time_end = Bound::Included(&summary.max_timestamp_micros); // Summary range inclusive
 
-                // Check for intersection
+                // Check intersection with query ranges
                 let offset_intersects = ranges_intersect(
                     summary_offset_start,
                     summary_offset_end,
-                    self.offset_range.0,
-                    self.offset_range.1,
+                    self.offset_range.0.as_ref(),
+                    self.offset_range.1.as_ref(),
                 );
                 let time_intersects = ranges_intersect(
                     summary_time_start,
                     summary_time_end,
-                    self.time_range_micros.0,
-                    self.time_range_micros.1,
+                    self.time_range_micros.0.as_ref(),
+                    self.time_range_micros.1.as_ref(),
                 );
 
-                // Update res[i]: if it doesn't intersect, mark as false
-                if !(offset_intersects && time_intersects) {
-                    res[i] = false;
-                    trace!(
-                        child_idx = i,
-                        summary = ?summary,
-                        offset_intersects,
-                        time_intersects,
-                        "  -> Pruning child"
-                    );
-                } else {
-                    trace!(
-                        child_idx = i,
-                        summary = ?summary,
-                        offset_intersects,
-                        time_intersects,
-                        "  -> Keeping child"
-                    );
+                // TODO: Add checks against value summaries here
+
+                let keep_child = offset_intersects && time_intersects;
+
+                // Log the decision for this child branch
+                trace!(
+                    branch_banyan_offset = _offset,
+                    child_idx = i,
+                    child_summary = ?summary,
+                    query_offset = ?self.offset_range,
+                    query_time = ?self.time_range_micros,
+                    offset_match = offset_intersects,
+                    time_match = time_intersects,
+                    keep = keep_child,
+                    "BanyanQuery::intersecting check"
+                );
+
+                // If the child summary's range doesn't intersect, prune it by setting res[i] = false
+                if !keep_child {
+                    // Safely set the bit if the index is valid
+                    if let Some(r) = res.get_mut(i) {
+                        *r = false;
+                    } else {
+                        warn!(
+                            child_idx = i,
+                            res_len = res.len(),
+                            "Child index out of bounds for res slice in intersecting"
+                        );
+                    }
                 }
+                // If keep_child is true, res[i] remains true, indicating we should descend into this child.
+            } else {
+                // This child was already pruned by a higher-level check
+                trace!(child_idx = i, child_summary = ?summary, "Skipping already pruned child branch");
             }
         }
     }
 }
 
-/// --- Value Filters (Applied *after* Banyan retrieval) ---
-#[derive(Debug, Clone, PartialEq)] // Added PartialEq
-pub enum Comparison {
-    Equals,
-    NotEquals,
-    GreaterThan,
-    GreaterThanOrEqual,
-    LessThan,
-    LessThanOrEqual,
-    // TODO:  In, NotIn, Contains
-}
+// --- Row-Level Filtering ---
 
-#[derive(Debug, Clone)]
-pub struct ValueFilter {
-    pub column_name: String,
-    pub operator: Comparison,
-    pub value: Value, // The value to compare against
-}
-
-// Helper to apply filters to a reconstructed row map (String -> Option<Value>)
-pub fn apply_value_filters(row: &BTreeMap<String, Option<Value>>, filters: &[ValueFilter]) -> bool {
+/// Applies user-defined value filters to a single, fully reconstructed row (`Record`).
+///
+/// This function is called by the result iterator *after* a row has been
+/// reconstructed from the decompressed columnar data. It checks if the row
+/// satisfies ALL provided `UserFilter` conditions (AND logic).
+///
+/// # Arguments
+/// * `row` - The reconstructed row (`BTreeMap<String, Option<Value>>`) to filter.
+/// * `filters` - A slice of `UserFilter` conditions to apply.
+///
+/// # Returns
+/// `true` if the row satisfies all filters (or if filters is empty), `false` otherwise.
+pub fn apply_user_filters(row: &Record, filters: &[UserFilter]) -> bool {
     if filters.is_empty() {
-        return true; // No filters means the row passes
+        return true; // No filters means the row passes automatically
     }
-    // All filters must pass
+
+    // Use `all()` for AND logic: every filter must return true
     filters.iter().all(|filter| {
         match row.get(&filter.column_name) {
             Some(Some(row_value)) => {
-                trace!(filter = ?filter, value = ?row_value, "Applying filter");
-                // Value exists and is not None, perform comparison
-                let result = compare_values(row_value, &filter.value, &filter.operator);
-                trace!(result = result, " -> Filter result");
-                result
+                // Column exists and has a non-null value
+                let matches = compare_values(row_value, &filter.value, &filter.operator);
+                trace!(filter = ?filter, ?row_value, matches, "Applying value filter");
+                matches
             }
             Some(None) => {
-                // Value exists but is None (NULL)
-                trace!(filter = ?filter, "Applying filter to NULL value");
-                // How filters handle NULL is important. Often, comparisons with NULL yield false.
-                // Exception: IS NULL / IS NOT NULL filters (if added).
-                // Current behavior: NULL comparison fails unless it's `NotEquals NULL`? Let's make it always false for now.
-                // Or maybe Equals with Null? Let's define: comparison ops always false with NULL.
-                trace!(" -> Filter result: false (NULL value)");
-                false // Filter fails if row value is NULL for standard comparisons
+                // Column exists but is NULL. Standard comparisons with NULL usually fail.
+                // TODO: Add specific IsNull/IsNotNull operators if needed.
+                trace!(filter = ?filter, row_value = "None", matches = false, "Applying value filter to NULL");
+                false
             }
             None => {
-                // Column not present in the (potentially partial) row map.
-                trace!(filter = ?filter, "Applying filter to missing column");
-                // This can happen if the column wasn't requested or during processing.
-                // Treat as filter failure.
-                error!(
-                    "Column '{}' required by filter not found in row data: {:?}",
-                    filter.column_name, row
-                );
-                trace!(" -> Filter result: false (missing column)");
+                // Column name in filter doesn't exist in the row (e.g., wasn't requested or doesn't exist in schema)
+                // This should generally not happen if validation is done correctly upstream,
+                // but handle defensively: a filter on a non-existent column fails.
+                warn!(filter_column = %filter.column_name, "Filter applied to column not present in the reconstructed row");
                 false
             }
         }
     })
 }
 
-// Comparison logic (Handles type matching for basic numeric/timestamp comparisons)
-fn compare_values(left: &Value, right: &Value, op: &Comparison) -> bool {
+/// Compares two `Value` instances based on the specified operator.
+///
+/// Handles basic type promotions (e.g., Integer to Float) for comparisons.
+/// Returns `false` for comparisons between incompatible types.
+fn compare_values(left: &Value, right: &Value, op: &UserFilterOp) -> bool {
     match op {
-        Comparison::Equals => left == right, // Relies on Value::PartialEq
-        Comparison::NotEquals => left != right, // Relies on Value::PartialEq
-        Comparison::GreaterThan => match (left, right) {
+        // Equality checks handle type mismatch implicitly via PartialEq
+        UserFilterOp::Equals => left == right,
+        UserFilterOp::NotEquals => left != right,
+
+        // Ordered comparisons require type matching or promotion
+        UserFilterOp::GreaterThan => match (left, right) {
             (Value::Integer(l), Value::Integer(r)) => l > r,
             (Value::Float(l), Value::Float(r)) => l > r,
             (Value::Timestamp(l), Value::Timestamp(r)) => l > r,
-            // Attempt float/int comparison by promoting int to float
+            (Value::String(l), Value::String(r)) => l > r,
+            (Value::Enum(l), Value::Enum(r)) => l > r, // Compare enum indices
+            // Promotions
             (Value::Float(l), Value::Integer(r)) => *l > (*r as f64),
             (Value::Integer(l), Value::Float(r)) => (*l as f64) > *r,
-            // Other type combinations are not comparable for GT
+            // Incompatible types for '>'
             _ => false,
         },
-        Comparison::GreaterThanOrEqual => match (left, right) {
+        UserFilterOp::GreaterThanOrEqual => match (left, right) {
             (Value::Integer(l), Value::Integer(r)) => l >= r,
             (Value::Float(l), Value::Float(r)) => l >= r,
             (Value::Timestamp(l), Value::Timestamp(r)) => l >= r,
+            (Value::String(l), Value::String(r)) => l >= r,
+            (Value::Enum(l), Value::Enum(r)) => l >= r,
+            // Promotions
             (Value::Float(l), Value::Integer(r)) => *l >= (*r as f64),
             (Value::Integer(l), Value::Float(r)) => (*l as f64) >= *r,
             _ => false,
         },
-        Comparison::LessThan => match (left, right) {
+        UserFilterOp::LessThan => match (left, right) {
             (Value::Integer(l), Value::Integer(r)) => l < r,
             (Value::Float(l), Value::Float(r)) => l < r,
             (Value::Timestamp(l), Value::Timestamp(r)) => l < r,
+            (Value::String(l), Value::String(r)) => l < r,
+            (Value::Enum(l), Value::Enum(r)) => l < r,
+            // Promotions
             (Value::Float(l), Value::Integer(r)) => *l < (*r as f64),
             (Value::Integer(l), Value::Float(r)) => (*l as f64) < *r,
             _ => false,
         },
-        Comparison::LessThanOrEqual => match (left, right) {
+        UserFilterOp::LessThanOrEqual => match (left, right) {
             (Value::Integer(l), Value::Integer(r)) => l <= r,
             (Value::Float(l), Value::Float(r)) => l <= r,
             (Value::Timestamp(l), Value::Timestamp(r)) => l <= r,
+            (Value::String(l), Value::String(r)) => l <= r,
+            (Value::Enum(l), Value::Enum(r)) => l <= r,
+            // Promotions
             (Value::Float(l), Value::Integer(r)) => *l <= (*r as f64),
             (Value::Integer(l), Value::Float(r)) => (*l as f64) <= *r,
             _ => false,
