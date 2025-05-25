@@ -91,7 +91,7 @@ fn record_from_csv<'dd>(
 
 fn usw_example<S: BanyanStore>(store: &S) -> Result<Cid> {
     let dd = usw_data_definition();
-    let mut reader = csv::Reader::from_path("rust-example/USW00003927.csv")?;
+    let mut reader = csv::Reader::from_path("./USW00003927.csv")?;
     let headers = reader
         .headers()?
         .iter()

@@ -1,7 +1,9 @@
 [workspace]
 
-members = [
+members = [ "columnar",
     "dclimate-banyan",
     "py-dclimate-banyan",
     "rust-example",
+    "columnar",
+    "columnar-example",
 ]
