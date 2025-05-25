@@ -1,6 +1,6 @@
 [workspace]
 
-members = [ "columnar",
+members = [
     "dclimate-banyan",
     "py-dclimate-banyan",
     "rust-example",
